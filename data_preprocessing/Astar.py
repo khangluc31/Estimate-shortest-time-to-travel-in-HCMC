@@ -1,6 +1,7 @@
 import Data_preprocessing as dp
 import heapq
 import math
+import folium
 def heuristic(cur_node, tar_node, graph):
     u=graph.vertices[cur_node]
     v=graph.vertices[tar_node]
@@ -85,6 +86,49 @@ def bidirection_Astar(graph, start, goal):
         path_b.append(cur)
         cur=par_b[cur]
     return path_f+path_b, best
+def create_route_map(graph, path, meet_node=None, output_file="route_map.html"):
+  if not path:
+    return
+  start_v = graph.vertices[path[0]]
+  goal_v = graph.vertices[path[-1]]
 
+  m = folium.Map(
+      location=[start_v.y, start_v.x], zoom_start=15, tiles="CartoDB positron"
+  )
+  coords = []
+  for i in range(len(path) - 1):
+    e = graph.get_edge(path[i], path[i + 1])
+    if e and e.geometry:
+      if coords and coords[-1] == e.geometry[0]:
+        coords.extend(e.geometry[1:])
+      else:
+        coords.extend(e.geometry)
+    else:
+      u_node, v_node = graph.vertices[path[i]], graph.vertices[path[i + 1]]
+      if not coords:
+        coords.append((u_node.y, u_node.x))
+      coords.append((v_node.y, v_node.x))
+
+  folium.PolyLine(
+      locations=coords, color="#0066FF", weight=5, opacity=0.85
+  ).add_to(m)
+  folium.Marker(
+      [start_v.y, start_v.x],
+      popup="Start",
+      icon=folium.Icon(color="green", icon="play", prefix="fa"),
+  ).add_to(m)
+  folium.Marker(
+      [goal_v.y, goal_v.x],
+      popup="Goal",
+      icon=folium.Icon(color="red", icon="flag", prefix="fa"),
+  ).add_to(m)
+  if meet_node and meet_node in graph.vertices:
+    meet_v = graph.vertices[meet_node]
+    folium.Marker(
+        [meet_v.y, meet_v.x],
+        popup="Meeting Node",
+        icon=folium.Icon(color="orange", icon="handshake-o", prefix="fa"),
+    ).add_to(m)
+  m.save(output_file)
 
 
