@@ -1,26 +1,28 @@
-"""Dark visual UI for the HCMC traffic-aware Bidirectional A* demo.
-
-Run with: streamlit run app.py
-The app reads the supplied CSV archive directly; set HCMC_DATA_DIR if needed.
-"""
-
 from __future__ import annotations
 
-import heapq
-import math
-import os
-import random
-from dataclasses import dataclass
-from pathlib import Path
-
 import folium
-import pandas as pd
 import streamlit as st
+import math
+from pathlib import Path
 from folium.plugins import Fullscreen
 from streamlit_folium import st_folium
 
+from Data_preprocessing import (
+    Graph,
+    load_graph,
+    ScenarioConfig,
+    ScenarioGenerator,
+    Hotspot,
+    RainCell,
+    haversine_m,
+    nearest_node,
+    roads
+)
 
-ROOT = Path(__file__).resolve().parent
+from Astar import bidirection_Astar
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "archive"
 BBOX = (10.8235, 10.7545, 106.7420, 106.6500)  # north, south, east, west
 LANDMARKS = {
     "Đại học Bách Khoa": (10.7721, 106.6578),
@@ -36,228 +38,371 @@ LANDMARKS = {
     "Thảo Cầm Viên": (10.7870, 106.7051),
     "Công viên Tao Đàn": (10.7744, 106.6920),
 }
-SPEEDS = {
-    "motorway": 120.0, "motorway_link": 80.0, "trunk": 80.0,
-    "trunk_link": 60.0, "primary": 60.0, "primary_link": 40.0,
-    "secondary": 50.0, "secondary_link": 40.0, "tertiary": 40.0,
-    "tertiary_link": 30.0, "residential": 30.0,
-    "unclassified": 30.0, "service": 20.0,
-}
-LOS_DENSITY = {"A": .08, "B": .20, "C": .35, "D": .50, "E": .68, "F": .84}
-
-
-@dataclass
-class Vertex:
-    node_id: int
-    lon: float
-    lat: float
-
-
-@dataclass
-class Edge:
-    segment_id: int
-    source: int
-    target: int
-    length: float
-    speed_limit: float
-    name: str
-    observed_density: float
-    density: float
-    weather: float = 1.0
-    blocked: bool = False
-
-    @property
-    def travel_time(self):
-        if self.blocked:
-            return math.inf
-        speed = max(self.speed_limit * (1 - self.density) * self.weather, self.speed_limit * .05)
-        return self.length / (speed / 3.6)
-
-
-class Graph:
-    def __init__(self):
-        self.vertices: dict[int, Vertex] = {}
-        self.adj: dict[int, dict[int, Edge]] = {}
-        self.radj: dict[int, dict[int, Edge]] = {}
-        self.v_max = 40.0
-
-    def add_vertex(self, vertex: Vertex):
-        self.vertices[vertex.node_id] = vertex
-        self.adj.setdefault(vertex.node_id, {})
-        self.radj.setdefault(vertex.node_id, {})
-
-    def add_edge(self, edge: Edge):
-        old = self.adj[edge.source].get(edge.target)
-        if old is not None and old.length <= edge.length:
-            return
-        self.adj[edge.source][edge.target] = edge
-        self.radj[edge.target][edge.source] = edge
-        self.v_max = max(self.v_max, edge.speed_limit)
-
-
-def find_data_dir() -> Path:
-    configured = os.environ.get("HCMC_DATA_DIR")
-    candidates = [
-        Path(configured).expanduser() if configured else None,
-        ROOT / "archive", ROOT / "data", Path.home() / "Downloads" / "archive",
-    ]
-    needed = {"nodes.csv", "segments.csv", "segment_status.csv", "train.csv"}
-    for folder in candidates:
-        if folder and folder.is_dir() and needed.issubset({p.name for p in folder.glob("*.csv")}):
-            return folder
-    raise FileNotFoundError("Không tìm thấy archive/. Đặt HCMC_DATA_DIR trỏ đến folder dữ liệu.")
-
 
 @st.cache_resource(show_spinner=False)
-def load_graph(folder_text: str) -> Graph:
-    folder = Path(folder_text)
-    north, south, east, west = BBOX
-    nodes = pd.read_csv(folder / "nodes.csv", usecols=["_id", "long", "lat"])
-    nodes = nodes[nodes.lat.between(south, north) & nodes.long.between(west, east)]
-    node_ids = set(nodes._id)
+def get_graph(bbox):
+    return load_graph(DATA_DIR, bbox)
 
-    segments = pd.read_csv(folder / "segments.csv", usecols=[
-        "_id", "s_node_id", "e_node_id", "length", "max_velocity", "street_name", "street_type",
-    ])
-    segments = segments[
-        segments.s_node_id.isin(node_ids) & segments.e_node_id.isin(node_ids)
-        & segments.street_type.isin(SPEEDS) & (segments.length > 0)
+def geo_line(graph: Graph, edge):
+    source = graph.vertices[edge.source]
+    target = graph.vertices[edge.target]
+
+    return [
+        [source.x, source.y],
+        [target.x, target.y]
     ]
-    status = pd.read_csv(folder / "segment_status.csv", usecols=["updated_at", "segment_id", "velocity"])
-    latest_velocity = status.sort_values("updated_at").groupby("segment_id").velocity.last().to_dict()
-    train = pd.read_csv(folder / "train.csv", usecols=["segment_id", "LOS"])
-    los = train.groupby("segment_id").LOS.agg(
-        lambda values: values.mode().iat[0] if not values.mode().empty else "A"
-    ).to_dict()
-
-    used = set(segments.s_node_id) | set(segments.e_node_id)
-    coords = {
-        int(node_id): (float(lon), float(lat))
-        for node_id, lon, lat in nodes[nodes._id.isin(used)].itertuples(index=False, name=None)
-    }
-    graph = Graph()
-    for node_id, (lon, lat) in coords.items():
-        graph.add_vertex(Vertex(node_id, lon, lat))
-    for sid, source, target, length, limit, name, road_type in segments.itertuples(index=False, name=None):
-        sid, source, target = int(sid), int(source), int(target)
-        speed = SPEEDS[str(road_type)] if pd.isna(limit) or limit <= 0 else float(limit)
-        measured = latest_velocity.get(sid)
-        density = (
-            max(0.0, min(.95, 1 - max(0.0, float(measured)) / speed))
-            if measured is not None else LOS_DENSITY.get(str(los.get(sid, "A")), .18)
-        )
-        graph.add_edge(Edge(sid, source, target, float(length), speed,
-                            "" if pd.isna(name) else str(name), density, density))
-    return graph
-
-
-def haversine(lat1, lon1, lat2, lon2):
-    radius = 6_371_000.0
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dp, dl = p2 - p1, math.radians(lon2 - lon1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * radius * math.asin(math.sqrt(a))
-
-
-def nearest_node(graph: Graph, point: tuple[float, float]):
-    lat, lon = point
-    return min(graph.vertices, key=lambda node: haversine(lat, lon, graph.vertices[node].lat, graph.vertices[node].lon))
-
-
-def heuristic(graph: Graph, node: int, goal: int):
-    a, b = graph.vertices[node], graph.vertices[goal]
-    return haversine(a.lat, a.lon, b.lat, b.lon) / (graph.v_max / 3.6)
-
-
-def bidirectional_astar(graph: Graph, start: int, goal: int):
-    if start == goal:
-        return [start], 0.0, {"forward": {start}, "backward": {goal}}
-    qf, qb, counter = [(heuristic(graph, start, goal), 0, start)], [(heuristic(graph, goal, start), 1, goal)], 2
-    gf, gb, pf, pb = {start: 0.0}, {goal: 0.0}, {start: None}, {goal: None}
-    cf, cb, best, meet = set(), set(), math.inf, None
-    while qf and qb:
-        if qf[0][0] >= best and qb[0][0] >= best:
-            break
-        forward = qf[0][0] <= qb[0][0]
-        queue, closed, costs, parents = (qf, cf, gf, pf) if forward else (qb, cb, gb, pb)
-        _, _, node = heapq.heappop(queue)
-        if node in closed:
-            continue
-        closed.add(node)
-        edges = graph.adj[node].values() if forward else graph.radj[node].values()
-        for edge in edges:
-            if edge.blocked:
-                continue
-            nxt = edge.target if forward else edge.source
-            candidate = costs[node] + edge.travel_time
-            if candidate >= costs.get(nxt, math.inf):
-                continue
-            costs[nxt], parents[nxt], counter = candidate, node, counter + 1
-            destination = goal if forward else start
-            heapq.heappush(queue, (candidate + heuristic(graph, nxt, destination), counter, nxt))
-            other_costs = gb if forward else gf
-            if nxt in other_costs and candidate + other_costs[nxt] < best:
-                best, meet = candidate + other_costs[nxt], nxt
-    trace = {"forward": cf, "backward": cb}
-    if meet is None:
-        return None, math.inf, trace
-    first, node = [], meet
-    while node is not None:
-        first.append(node)
-        node = pf[node]
-    first.reverse()
-    second, node = [], pb[meet]
-    while node is not None:
-        second.append(node)
-        node = pb[node]
-    return first + second, best, trace
-
-
-def apply_scenario(graph: Graph, traffic: float, weather: float, incidents: float, seed: int):
-    rng, blocked = random.Random(seed), {}
-    for edges in graph.adj.values():
-        for edge in edges.values():
-            edge.density = min(.95, edge.observed_density * traffic)
-            edge.weather = weather
-            blocked.setdefault(edge.segment_id, rng.random() < incidents)
-            edge.blocked = blocked[edge.segment_id]
-
-
-def geo_line(graph: Graph, edge: Edge):
-    a, b = graph.vertices[edge.source], graph.vertices[edge.target]
-    return [[a.lon, a.lat], [b.lon, b.lat]]
-
 
 def add_lines(map_object, lines, color, weight, opacity):
     if lines:
-        folium.GeoJson({"type": "MultiLineString", "coordinates": lines}, style_function=lambda _: {
-            "color": color, "weight": weight, "opacity": opacity,
-        }).add_to(map_object)
+        folium.GeoJson(
+            {
+                "type": "MultiLineString",
+                "coordinates": lines
+            },
+            style_function=lambda _: {
+                "color": color,
+                "weight": weight,
+                "opacity": opacity,
+            }
+        ).add_to(map_object)
 
+def create_map(bbox):
+    north, south, east, west = bbox
 
-def build_map(graph: Graph):
-    north, south, east, west = BBOX
-    map_object = folium.Map([10.789, 106.696], zoom_start=13, tiles=None, prefer_canvas=True)
-    map_object.get_root().header.add_child(folium.Element("<style>.leaflet-container{background:#020508!important}</style>"))
+    center_lat = (north + south) / 2
+    center_lon = (east + west) / 2
+
+    map_object = folium.Map(
+        [center_lat, center_lon],
+        zoom_start=13,
+        tiles=None,
+        prefer_canvas=True
+    )
+
+    map_object.get_root().header.add_child(
+        folium.Element(
+            "<style>.leaflet-container{background:#020508!important}</style>"
+        )
+    )
+
     Fullscreen(position="bottomright").add_to(map_object)
-    add_lines(map_object, [geo_line(graph, edge) for edges in graph.adj.values() for edge in edges.values()], "#21e6e6", 1.15, .58)
 
-    trace = st.session_state.trace
-    if trace:
-        start, goal = st.session_state.start, st.session_state.goal
-        forward = {node for node in trace["forward"] if haversine(start[0], start[1], graph.vertices[node].lat, graph.vertices[node].lon) <= 1250}
-        backward = {node for node in trace["backward"] if haversine(goal[0], goal[1], graph.vertices[node].lat, graph.vertices[node].lon) <= 1250}
-        add_lines(map_object, [geo_line(graph, e) for n in forward for e in graph.adj[n].values() if e.target in forward], "#b900ff", 2.1, .7)
-        add_lines(map_object, [geo_line(graph, e) for n in backward for e in graph.radj[n].values() if e.source in backward], "#ff00c8", 2.1, .7)
-    if st.session_state.path:
-        route = [[graph.vertices[node].lat, graph.vertices[node].lon] for node in st.session_state.path]
-        folium.PolyLine(route, color="#8c00ff", weight=12, opacity=.30).add_to(map_object)
-        folium.PolyLine(route, color="#ff00f5", weight=4, opacity=1).add_to(map_object)
-    for point, label, color in [(st.session_state.start, "Start", "#ff22f2"), (st.session_state.goal, "Goal", "#20eff2")]:
-        folium.CircleMarker(point, radius=8, color="white", weight=2, fill=True, fill_color=color, fill_opacity=1, tooltip=label).add_to(map_object)
     map_object.fit_bounds([[south, west], [north, east]])
     return map_object
 
+def add_network(map_object, graph):
+    lines = [
+        geo_line(graph, edge)
+        for edges in graph.adj.values()
+        for edge in edges.values()
+    ]
+
+    add_lines(
+        map_object,
+        lines,
+        "#21e6e6",
+        1.15,
+        0.58
+    )
+
+def bearing_degrees(source, target):
+    lat1 = math.radians(source.y)
+    lat2 = math.radians(target.y)
+
+    d_lon = math.radians(target.x - source.x)
+
+    x = math.sin(d_lon) * math.cos(lat2)
+    y = (
+        math.cos(lat1) * math.sin(lat2)
+        - math.sin(lat1) * math.cos(lat2) * math.cos(d_lon)
+    )
+
+    return (math.degrees(math.atan2(x, y)) + 360) % 360
+
+def add_one_way_roads(map_object, graph, min_gap_m=120, min_edge_m=40):
+    M_PER_DEG = 111_320
+    cell = min_gap_m / M_PER_DEG          # grid cell size in degrees
+    occupied = set()
+
+    shafts, heads = [], []
+
+    for edge, twin, midpoint in roads(graph):
+        if twin is not None:
+            continue
+
+        s = graph.vertices[edge.source]
+        t = graph.vertices[edge.target]
+
+        mid_lat, mid_lon = midpoint
+        k = math.cos(math.radians(mid_lat))
+
+        # direction in metric-ish space (x scaled by cos(lat))
+        vx = (t.x - s.x) * k
+        vy = (t.y - s.y)
+        length_m = math.hypot(vx, vy) * M_PER_DEG
+        if length_m < min_edge_m:
+            continue
+
+        # thinning: one arrow per grid cell
+        key = (int(mid_lat / cell), int(mid_lon / cell))
+        if key in occupied:
+            continue
+        occupied.add(key)
+
+        vx, vy = vx / math.hypot(vx, vy), vy / math.hypot(vx, vy)
+
+        L = 0.00012          # half shaft length (deg of latitude)
+        H = L * 0.6          # head length
+        W = L * 0.35         # head half-width
+
+        def pt(ax, ay):      # metric offset -> lon/lat
+            return [mid_lon + ax / k, mid_lat + ay]
+
+        tail = pt(-vx * L, -vy * L)
+        tip  = pt( vx * L,  vy * L)
+
+        left  = pt(vx * (L - H) - vy * W, vy * (L - H) + vx * W)
+        right = pt(vx * (L - H) + vy * W, vy * (L - H) - vx * W)
+
+        shafts.append([tail, tip])
+        heads.append([left, tip, right])   # one polyline, not two
+
+    add_lines(map_object, shafts + heads, "#00ff66", 2.0, 0.9)
+
+def add_search_trace(map_object, graph: Graph):
+    trace = st.session_state.trace
+
+    if not trace:
+        return
+
+    start = st.session_state.start
+    goal = st.session_state.goal
+
+    forward = {
+        node
+        for node in trace["forward"]
+        if haversine_m(
+            start[0],
+            start[1],
+            graph.vertices[node].y,
+            graph.vertices[node].x
+        ) <= 1250
+    }
+
+    backward = {
+        node
+        for node in trace["backward"]
+        if haversine_m(
+            goal[0],
+            goal[1],
+            graph.vertices[node].y,
+            graph.vertices[node].x
+        ) <= 1250
+    }
+
+    forward_lines = [
+        geo_line(graph, edge)
+        for node in forward
+        for edge in graph.adj[node].values()
+        if edge.target in forward
+    ]
+
+    backward_lines = [
+        geo_line(graph, edge)
+        for node in backward
+        for edge in graph.radj[node].values()
+        if edge.source in backward
+    ]
+
+    add_lines(
+        map_object,
+        forward_lines,
+        "#b900ff",
+        2.1,
+        .7
+    )
+
+    add_lines(
+        map_object,
+        backward_lines,
+        "#ff00c8",
+        2.1,
+        .7
+    )
+
+def add_route(map_object, graph: Graph):
+    if not st.session_state.path:
+        return
+
+    route = [
+        [graph.vertices[node].y, graph.vertices[node].x]
+        for node in st.session_state.path
+    ]
+
+    folium.PolyLine(
+        route,
+        color="#8c00ff",
+        weight=12,
+        opacity=.30
+    ).add_to(map_object)
+
+    folium.PolyLine(
+        route,
+        color="#ff00f5",
+        weight=4,
+        opacity=1
+    ).add_to(map_object)
+
+def add_markers(map_object):
+    for point, label, color in [
+        (st.session_state.start, "Start", "#ff22f2"),
+        (st.session_state.goal, "Goal", "#20eff2")
+    ]:
+        folium.CircleMarker(
+            point,
+            radius=8,
+            color="white",
+            weight=2,
+            fill=True,
+            fill_color=color,
+            fill_opacity=1,
+            tooltip=label
+        ).add_to(map_object)
+
+def add_hotspots(map_object, hotspots):
+    for hotspot in hotspots:
+
+        folium.Circle(
+            location=[hotspot.lat, hotspot.lon],
+            radius=hotspot.radius,
+            color="#ff0000",
+            weight=2,
+            fill=True,
+            fill_color="#ff0000",
+            fill_opacity=0.25,
+            tooltip=(
+                f"Traffic hotspot · "
+                f"intensity {hotspot.intensity:.2f}"
+            ),
+        ).add_to(map_object)
+
+def add_rain_cells(map_object, rain_cells):
+    for cell in rain_cells:
+        bounds = [
+            [cell.min_lat, cell.min_lon],
+            [cell.max_lat, cell.max_lon],
+        ]
+
+        folium.Rectangle(
+            bounds=bounds,
+            tooltip=f"Rain · factor {cell.weather_factor:.2f}",
+        ).add_to(map_object)
+
+def add_blocked_roads(map_object, graph: Graph):
+    lines = [
+        geo_line(graph, edge)
+        for edge, _, _ in roads(graph)
+        if edge.blocked
+    ]
+
+    add_lines(
+        map_object,
+        lines,
+        "#ff3b30",
+        4,
+        0.9
+    )
+
+def add_scenario(map_object, graph: Graph, config: ScenarioConfig):
+    add_hotspots(map_object, config.hotspots)
+    add_rain_cells(map_object, config.rain_cells)
+    add_blocked_roads(map_object, graph)
+
+def build_map(graph, config, show_directions=False):
+    map_object = create_map(BBOX)
+
+    add_network(map_object, graph)
+    add_one_way_roads(map_object, graph)
+
+    add_scenario(map_object, graph, config)
+    add_search_trace(map_object, graph)
+    add_route(map_object, graph)
+    add_markers(map_object)
+
+    return map_object
+
+def run_route(graph, generator):
+    generator.apply(graph)
+
+    print("========== SCENARIO ==========")
+    print("BASE DENSITY:", generator.config.base_density)
+    print("MAX DENSITY:", generator.config.max_density)
+    print("DENSITY DEVIATION:", generator.config.density_deviation)
+    print("HOTSPOTS:", len(generator.config.hotspots))
+    print("BLOCK PROBABILITY:", generator.config.block_probability)
+    print("GLOBAL WEATHER:", generator.config.global_weather_factor)
+    print("RAIN CELLS:", len(generator.config.rain_cells))
+
+    # --------------------------------------------------------
+    # Check generated edge state
+    # --------------------------------------------------------
+
+    edges = [
+        edge
+        for targets in graph.adj.values()
+        for edge in targets.values()
+    ]
+
+    print("EDGES:", len(edges))
+    print(
+        "DENSITY:",
+        min(edge.density for edge in edges),
+        "->",
+        max(edge.density for edge in edges)
+    )
+    print(
+        "BLOCKED:",
+        sum(edge.blocked for edge in edges)
+    )
+    print(
+        "WEATHER:",
+        min(edge.weather_factor for edge in edges),
+        "->",
+        max(edge.weather_factor for edge in edges)
+    )
+
+    # --------------------------------------------------------
+    # Routing
+    # --------------------------------------------------------
+
+    start_node = nearest_node(graph, st.session_state.start)
+    goal_node = nearest_node(graph, st.session_state.goal)
+
+    print("START:", start_node)
+    print("GOAL:", goal_node)
+    print("START OUT:", len(graph.adj[start_node]))
+    print("START IN:", len(graph.radj[start_node]))
+    print("GOAL OUT:", len(graph.adj[goal_node]))
+    print("GOAL IN:", len(graph.radj[goal_node]))
+
+    path, cost, trace = bidirection_Astar(
+        graph,
+        start_node,
+        goal_node
+    )
+
+    print("PATH:", path)
+    print("COST:", cost)
+    print("FORWARD:", len(trace["forward"]))
+    print("BACKWARD:", len(trace["backward"]))
+
+    st.session_state.path = path
+    st.session_state.trace = trace
+    st.session_state.route_stats = (
+        get_stats(graph, path, trace)
+        if path
+        else None
+    )
 
 def get_stats(graph: Graph, path, trace):
     edges = [graph.adj[a][b] for a, b in zip(path, path[1:])]
@@ -284,68 +429,611 @@ section[data-testid="stSidebar"][aria-expanded="false"]{margin-left:0!important;
 .badge{position:fixed;left:360px;bottom:18px;z-index:9999;color:#8eeff1;background:rgba(0,8,13,.76);border:1px solid rgba(33,230,230,.3);border-radius:99px;padding:8px 13px;font:600 10px 'DM Sans';letter-spacing:.08em;pointer-events:none}.metric{color:#ddffff;border:1px solid rgba(33,230,230,.2);background:rgba(33,230,230,.05);border-radius:7px;padding:9px 11px;margin:7px 0}.metric b{float:right;color:white}@media(max-width:900px){.map-title{display:none}.badge{left:360px}} iframe{display:block;border:0!important}
 </style>""", unsafe_allow_html=True)
 
-defaults = {"start": LANDMARKS["Đại học Bách Khoa"], "goal": LANDMARKS["Landmark 81"], "start_name": "Đại học Bách Khoa", "goal_name": "Landmark 81", "path": None, "trace": None, "route_stats": None, "clicked": None, "demo_done": False}
+defaults = {
+    "start": LANDMARKS["Đại học Bách Khoa"],
+    "goal": LANDMARKS["Landmark 81"],
+    "start_name": "Đại học Bách Khoa",
+    "goal_name": "Landmark 81",
+
+    "path": None,
+    "trace": None,
+    "route_stats": None,
+    "clicked": None,
+    "demo_done": False,
+
+    "scenario_config": ScenarioConfig(
+        base_density=0.1,
+        max_density=0.9,
+        density_deviation=0.05,
+
+        hotspots=[
+            Hotspot(
+                lat=10.775,
+                lon=106.700,
+                radius=500,
+                intensity=0.8,
+            )
+        ],
+
+        block_probability=0.01,
+
+        global_weather_factor=1.0,
+
+        rain_cells=[
+            RainCell(
+                min_lat=10.771,
+                max_lat=10.775,
+                min_lon=106.696,
+                max_lon=106.700,
+                weather_factor=0.65,
+            )
+        ],
+    ),
+
+    "scenario_seed": 42,
+}
+
 for key, value in defaults.items():
-    st.session_state.setdefault(key, value)
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+# Give each hotspot a stable ID for its widget keys.
+# This prevents editing/removing one hotspot from mixing up
+# the values of the remaining hotspots.
+if "hotspot_ids" not in st.session_state:
+    st.session_state.hotspot_ids = list(
+        range(len(st.session_state.scenario_config.hotspots))
+    )
+
+if "next_hotspot_id" not in st.session_state:
+    st.session_state.next_hotspot_id = (
+        max(st.session_state.hotspot_ids, default=-1) + 1
+    )
+
+if "rain_cell_ids" not in st.session_state:
+    st.session_state.rain_cell_ids = list(
+        range(len(st.session_state.scenario_config.rain_cells))
+    )
+
+if "next_rain_cell_id" not in st.session_state:
+    st.session_state.next_rain_cell_id = (
+        max(st.session_state.rain_cell_ids, default=-1) + 1
+    )
 
 try:
-    folder = find_data_dir()
     with st.spinner("Loading HCMC street network…"):
-        graph = load_graph(str(folder))
+        graph = get_graph(BBOX)
 except Exception as error:
-    st.error(str(error)); st.stop()
+    st.error(str(error))
+    st.stop()
+
+
+# ============================================================
+# Initial demo route
+# ============================================================
 
 if not st.session_state.demo_done:
-    apply_scenario(graph, 1.0, 1.0, 0.0, 42)
-    path, _, trace = bidirectional_astar(graph, nearest_node(graph, st.session_state.start), nearest_node(graph, st.session_state.goal))
-    st.session_state.path, st.session_state.trace = path, trace
-    st.session_state.route_stats = get_stats(graph, path, trace) if path else None
+    generator = ScenarioGenerator(
+        seed=st.session_state.scenario_seed,
+        config=st.session_state.scenario_config,
+    )
+
+    run_route(graph, generator)
+
     st.session_state.demo_done = True
+
+
+# ============================================================
+# Sidebar
+# ============================================================
 
 with st.sidebar:
     st.markdown("## Route explorer")
-    st.caption("Bidirectional A* using the supplied HCMC CSV data.")
-    st.write(f"**{len(graph.vertices):,}** nodes · **{sum(map(len, graph.adj.values())):,}** edges")
-    click_mode = st.radio("Map click sets", ["Start", "Goal"], horizontal=True)
+    st.caption("Bidirectional A* using the HCMC road network.")
+
+    st.write(
+        f"**{len(graph.vertices):,}** nodes · "
+        f"**{sum(map(len, graph.adj.values())):,}** edges"
+    )
+
+    # --------------------------------------------------------
+    # Route selection
+    # --------------------------------------------------------
+
+    click_mode = st.radio(
+        "Map click sets",
+        ["Start", "Goal"],
+        horizontal=True,
+    )
+
     names = list(LANDMARKS)
-    start_name = st.selectbox("Start", names, index=names.index(st.session_state.start_name) if st.session_state.start_name in names else 0)
-    goal_name = st.selectbox("Goal", names, index=names.index(st.session_state.goal_name) if st.session_state.goal_name in names else 1)
-    if st.button("Use selected places", use_container_width=True):
-        st.session_state.start, st.session_state.goal = LANDMARKS[start_name], LANDMARKS[goal_name]
-        st.session_state.start_name, st.session_state.goal_name = start_name, goal_name
-        st.session_state.path = st.session_state.trace = st.session_state.route_stats = None
-    traffic = st.slider("Traffic intensity", .6, 1.6, 1., .05)
-    weather_name = st.select_slider("Weather", ["Clear", "Light rain", "Heavy rain"], value="Clear")
-    incidents = st.slider("Incident probability", 0., .08, 0., .01)
-    seed = st.number_input("Scenario seed", 0, 9999, 42)
-    if st.button("Run Bidirectional A*", type="primary", use_container_width=True):
-        weather = {"Clear": 1.0, "Light rain": .82, "Heavy rain": .64}[weather_name]
-        apply_scenario(graph, traffic, weather, incidents, int(seed))
-        path, _, trace = bidirectional_astar(graph, nearest_node(graph, st.session_state.start), nearest_node(graph, st.session_state.goal))
-        st.session_state.path, st.session_state.trace = path, trace
-        st.session_state.route_stats = get_stats(graph, path, trace) if path else None
+
+    start_name = st.selectbox(
+        "Start",
+        names,
+        index=(
+            names.index(st.session_state.start_name)
+            if st.session_state.start_name in names
+            else 0
+        ),
+    )
+
+    goal_name = st.selectbox(
+        "Goal",
+        names,
+        index=(
+            names.index(st.session_state.goal_name)
+            if st.session_state.goal_name in names
+            else 1
+        ),
+    )
+
+    if st.button(
+        "Use selected places",
+        use_container_width=True,
+    ):
+        st.session_state.start = LANDMARKS[start_name]
+        st.session_state.goal = LANDMARKS[goal_name]
+
+        st.session_state.start_name = start_name
+        st.session_state.goal_name = goal_name
+
+        st.session_state.path = None
+        st.session_state.trace = None
+        st.session_state.route_stats = None
+
+    # --------------------------------------------------------
+    # Scenario configuration
+    # --------------------------------------------------------
+
+    st.markdown("### Scenario")
+
+    config = st.session_state.scenario_config
+
+    base_density = st.slider(
+        "Base density",
+        min_value=0.0,
+        max_value=1.0,
+        value=float(config.base_density),
+        step=0.01,
+    )
+
+    max_density = st.slider(
+        "Maximum density",
+        min_value=0.0,
+        max_value=1.0,
+        value=float(config.max_density),
+        step=0.01,
+    )
+
+    density_deviation = st.slider(
+        "Density deviation",
+        min_value=0.0,
+        max_value=0.25,
+        value=float(config.density_deviation),
+        step=0.01,
+    )
+
+    block_probability = st.slider(
+        "Road block probability",
+        min_value=0.0,
+        max_value=0.10,
+        value=float(config.block_probability),
+        step=0.005,
+    )
+
+    global_weather_factor = st.slider(
+        "Global weather factor",
+        min_value=0.05,
+        max_value=1.0,
+        value=float(config.global_weather_factor),
+        step=0.05,
+    )
+
+    # --------------------------------------------------------
+    # Hotspot management
+    # --------------------------------------------------------
+
+    st.markdown("#### Traffic hotspots")
+
+    config = st.session_state.scenario_config
+    hotspot_ids = st.session_state.hotspot_ids
+
+    remove_hotspot_id = None
+
+    if not config.hotspots:
+        st.caption("No hotspots configured.")
+
+    for index, (hotspot, hotspot_id) in enumerate(
+        zip(config.hotspots, hotspot_ids)
+    ):
+        with st.expander(f"Hotspot {index + 1}", expanded=True):
+            col1, col2 = st.columns(2)
+
+            with col1:
+                lat = st.number_input(
+                    "Latitude",
+                    min_value=-90.0,
+                    max_value=90.0,
+                    value=float(hotspot.lat),
+                    step=0.001,
+                    format="%.6f",
+                    key=f"hotspot_lat_{hotspot_id}",
+                )
+
+            with col2:
+                lon = st.number_input(
+                    "Longitude",
+                    min_value=-180.0,
+                    max_value=180.0,
+                    value=float(hotspot.lon),
+                    step=0.001,
+                    format="%.6f",
+                    key=f"hotspot_lon_{hotspot_id}",
+                )
+
+            radius = st.number_input(
+                "Radius (meters)",
+                min_value=50,
+                max_value=5000,
+                value=int(hotspot.radius),
+                step=50,
+                key=f"hotspot_radius_{hotspot_id}",
+            )
+
+            intensity = st.slider(
+                "Intensity",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(hotspot.intensity),
+                step=0.05,
+                key=f"hotspot_intensity_{hotspot_id}",
+            )
+
+            # Keep the persistent config synchronized with
+            # the hotspot widgets.
+            hotspot.lat = lat
+            hotspot.lon = lon
+            hotspot.radius = radius
+            hotspot.intensity = intensity
+
+            if st.button(
+                f"Remove hotspot {index + 1}",
+                key=f"remove_hotspot_{hotspot_id}",
+                use_container_width=True,
+            ):
+                remove_hotspot_id = hotspot_id
+
+    # Process removal after rendering the current list.
+    if remove_hotspot_id is not None:
+        remove_index = hotspot_ids.index(remove_hotspot_id)
+
+        config.hotspots.pop(remove_index)
+        hotspot_ids.pop(remove_index)
+
+        # Invalidate the previous route because the scenario changed.
+        st.session_state.path = None
+        st.session_state.trace = None
+        st.session_state.route_stats = None
+
         st.rerun()
+
+    if st.button(
+        "＋ Add hotspot",
+        use_container_width=True,
+    ):
+        new_hotspot_id = st.session_state.next_hotspot_id
+        st.session_state.next_hotspot_id += 1
+
+        config.hotspots.append(
+            Hotspot(
+                lat=10.775,
+                lon=106.700,
+                radius=500,
+                intensity=0.8,
+            )
+        )
+
+        hotspot_ids.append(new_hotspot_id)
+
+        st.session_state.path = None
+        st.session_state.trace = None
+        st.session_state.route_stats = None
+
+        st.rerun()
+
+    # --------------------------------------------------------
+    # Rain-cell management
+    # --------------------------------------------------------
+
+    st.markdown("#### Rain cells")
+
+    config = st.session_state.scenario_config
+    rain_cell_ids = st.session_state.rain_cell_ids
+
+    remove_rain_cell_id = None
+
+    if not config.rain_cells:
+        st.caption("No rain cells configured.")
+
+    for index, (rain_cell, rain_cell_id) in enumerate(
+        zip(config.rain_cells, rain_cell_ids)
+    ):
+        with st.expander(
+            f"Rain cell {index + 1}",
+            expanded=True,
+        ):
+            st.caption("Rectangular weather region")
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                min_lat = st.number_input(
+                    "South latitude",
+                    min_value=-90.0,
+                    max_value=90.0,
+                    value=float(rain_cell.min_lat),
+                    step=0.001,
+                    format="%.6f",
+                    key=f"rain_min_lat_{rain_cell_id}",
+                )
+
+            with col2:
+                max_lat = st.number_input(
+                    "North latitude",
+                    min_value=-90.0,
+                    max_value=90.0,
+                    value=float(rain_cell.max_lat),
+                    step=0.001,
+                    format="%.6f",
+                    key=f"rain_max_lat_{rain_cell_id}",
+                )
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                min_lon = st.number_input(
+                    "West longitude",
+                    min_value=-180.0,
+                    max_value=180.0,
+                    value=float(rain_cell.min_lon),
+                    step=0.001,
+                    format="%.6f",
+                    key=f"rain_min_lon_{rain_cell_id}",
+                )
+
+            with col2:
+                max_lon = st.number_input(
+                    "East longitude",
+                    min_value=-180.0,
+                    max_value=180.0,
+                    value=float(rain_cell.max_lon),
+                    step=0.001,
+                    format="%.6f",
+                    key=f"rain_max_lon_{rain_cell_id}",
+                )
+
+            weather_factor = st.slider(
+                "Weather factor",
+                min_value=0.05,
+                max_value=1.0,
+                value=float(rain_cell.weather_factor),
+                step=0.05,
+                key=f"rain_factor_{rain_cell_id}",
+            )
+
+            # Validate geographic bounds.
+            if min_lat >= max_lat:
+                st.error(
+                    "South latitude must be smaller than north latitude."
+                )
+
+            if min_lon >= max_lon:
+                st.error(
+                    "West longitude must be smaller than east longitude."
+                )
+
+            # Keep persistent configuration synchronized.
+            rain_cell.min_lat = min_lat
+            rain_cell.max_lat = max_lat
+            rain_cell.min_lon = min_lon
+            rain_cell.max_lon = max_lon
+            rain_cell.weather_factor = weather_factor
+
+            if st.button(
+                f"Remove rain cell {index + 1}",
+                key=f"remove_rain_cell_{rain_cell_id}",
+                use_container_width=True,
+            ):
+                remove_rain_cell_id = rain_cell_id
+
+
+    # --------------------------------------------------------
+    # Process rain-cell removal
+    # --------------------------------------------------------
+
+    if remove_rain_cell_id is not None:
+        remove_index = rain_cell_ids.index(remove_rain_cell_id)
+
+        config.rain_cells.pop(remove_index)
+        rain_cell_ids.pop(remove_index)
+
+        st.session_state.path = None
+        st.session_state.trace = None
+        st.session_state.route_stats = None
+
+        st.rerun()
+
+
+    # --------------------------------------------------------
+    # Add rain cell
+    # --------------------------------------------------------
+
+    if st.button(
+        "＋ Add rain cell",
+        use_container_width=True,
+    ):
+        new_rain_cell_id = st.session_state.next_rain_cell_id
+        st.session_state.next_rain_cell_id += 1
+
+        config.rain_cells.append(
+            RainCell(
+                min_lat=10.771,
+                max_lat=10.775,
+                min_lon=106.696,
+                max_lon=106.700,
+                weather_factor=0.65,
+            )
+        )
+
+        rain_cell_ids.append(new_rain_cell_id)
+
+        st.session_state.path = None
+        st.session_state.trace = None
+        st.session_state.route_stats = None
+
+        st.rerun()
+
+    seed = st.number_input(
+        "Scenario seed",
+        min_value=0,
+        max_value=9999,
+        value=int(st.session_state.scenario_seed),
+        step=1,
+    )
+
+    # --------------------------------------------------------
+    # Validate scenario configuration
+    # --------------------------------------------------------
+
+    if max_density < base_density:
+        st.error(
+            "Maximum density must be greater than or equal "
+            "to base density."
+        )
+
+    # --------------------------------------------------------
+    # Run route
+    # --------------------------------------------------------
+
+    if st.button(
+        "Run Bidirectional A*",
+        type="primary",
+        use_container_width=True,
+        disabled=max_density < base_density,
+    ):
+        # Update the persistent configuration.
+        config.base_density = base_density
+        config.max_density = max_density
+        config.density_deviation = density_deviation
+        config.block_probability = block_probability
+        config.global_weather_factor = global_weather_factor
+
+        st.session_state.scenario_seed = int(seed)
+
+        # Use the persistent configuration.
+        generator = ScenarioGenerator(
+            seed=st.session_state.scenario_seed,
+            config=st.session_state.scenario_config,
+        )
+
+        run_route(graph, generator)
+
+        st.rerun()
+
+    # --------------------------------------------------------
+    # Route result
+    # --------------------------------------------------------
+
     if st.session_state.route_stats:
         info = st.session_state.route_stats
+
         st.markdown("### Route result")
-        st.markdown(f'<div class="metric">Travel time <b>{info["time"]/60:.1f} min</b></div><div class="metric">Distance <b>{info["distance"]/1000:.2f} km</b></div><div class="metric">Expanded <b>{info["expanded"]:,}</b></div>', unsafe_allow_html=True)
+
+        st.markdown(
+            f'<div class="metric">Travel time '
+            f'<b>{info["time"] / 60:.1f} min</b></div>'
+            f'<div class="metric">Distance '
+            f'<b>{info["distance"] / 1000:.2f} km</b></div>'
+            f'<div class="metric">Expanded '
+            f'<b>{info["expanded"]:,}</b></div>',
+            unsafe_allow_html=True,
+        )
+
         with st.expander("Road sequence"):
             for index, road in enumerate(info["roads"], 1):
                 st.caption(f"{index:02d}  {road}")
 
-st.markdown('<div class="map-title"><div class="city">Ho Chi Minh City · Traffic Network</div><div class="main">Bidirectional A*</div><div class="sub">Heuristic: Great-circle Distance</div></div>', unsafe_allow_html=True)
-output = st_folium(build_map(graph), height=850, use_container_width=True, returned_objects=["last_clicked"], key="hcmc-dark-map")
-st.markdown(f'<div class="badge">CYAN · STREET NETWORK&nbsp;&nbsp;&nbsp; MAGENTA · SEARCH + ROUTE&nbsp;&nbsp;&nbsp; {len(graph.vertices):,} NODES</div>', unsafe_allow_html=True)
+
+# ============================================================
+# Map
+# ============================================================
+
+st.markdown(
+    '<div class="map-title">'
+    '<div class="city">Ho Chi Minh City · Traffic Network</div>'
+    '<div class="main">Bidirectional A*</div>'
+    '<div class="sub">Heuristic: Great-circle Distance</div>'
+    '</div>',
+    unsafe_allow_html=True,
+)
+
+output = st_folium(
+    build_map(
+        graph,
+        st.session_state.scenario_config,
+    ),
+    height=850,
+    use_container_width=True,
+    returned_objects=["last_clicked"],
+    key="hcmc-dark-map",
+)
+
+
+# ============================================================
+# Map legend / status
+# ============================================================
+
+st.markdown(
+    f'<div class="badge">'
+    f'CYAN · STREET NETWORK&nbsp;&nbsp;&nbsp; '
+    f'MAGENTA · SEARCH + ROUTE&nbsp;&nbsp;&nbsp; '
+    f'{len(graph.vertices):,} NODES'
+    f'</div>',
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================
+# Map click handling
+# ============================================================
 
 clicked = output.get("last_clicked") if output else None
+
 if clicked:
-    signature = (round(clicked["lat"], 6), round(clicked["lng"], 6), click_mode)
+    signature = (
+        round(clicked["lat"], 6),
+        round(clicked["lng"], 6),
+        click_mode,
+    )
+
     if signature != st.session_state.clicked:
-        point = (clicked["lat"], clicked["lng"])
+        point = (
+            clicked["lat"],
+            clicked["lng"],
+        )
+
         if click_mode == "Start":
-            st.session_state.start, st.session_state.start_name = point, "Custom map point"
+            st.session_state.start = point
+            st.session_state.start_name = "Custom map point"
         else:
-            st.session_state.goal, st.session_state.goal_name = point, "Custom map point"
+            st.session_state.goal = point
+            st.session_state.goal_name = "Custom map point"
+
         st.session_state.clicked = signature
-        st.session_state.path = st.session_state.trace = st.session_state.route_stats = None
+
+        st.session_state.path = None
+        st.session_state.trace = None
+        st.session_state.route_stats = None
+
         st.rerun()
