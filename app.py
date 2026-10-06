@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import folium
 import streamlit as st
+import html
+import json
 import math
 from pathlib import Path
+from string import Template as CssTemplate
+from branca.element import MacroElement
 from folium.plugins import Fullscreen
+from jinja2 import Template
 from streamlit_folium import st_folium
 
 from Data_preprocessing import (
@@ -38,6 +43,42 @@ LANDMARKS = {
     "Thảo Cầm Viên": (10.7870, 106.7051),
     "Công viên Tao Đàn": (10.7744, 106.6920),
 }
+THEMES = {
+    "dark": {
+        "scheme": "dark", "bg": "#020508",
+        "sidebar_bg": "rgba(2,7,11,.97)", "sidebar_border": "rgba(33,230,230,.28)",
+        "heading": "#efffff", "text": "#9bc9cc", "accent": "#21e6e6",
+        "title": "white", "title_shadow": "0 3px 24px #000",
+        "badge_text": "#8eeff1", "badge_bg": "rgba(0,8,13,.76)", "badge_border": "rgba(33,230,230,.3)",
+        "metric_text": "#ddffff", "metric_border": "rgba(33,230,230,.2)",
+        "metric_bg": "rgba(33,230,230,.05)", "metric_value": "white",
+        "input_bg": "#0b1a22", "input_text": "#e6ffff", "input_border": "rgba(33,230,230,.30)",
+        "menu_bg": "#07141b", "menu_hover": "rgba(33,230,230,.14)",
+        "street": "#21e6e6", "street_weight": 1.15, "street_opacity": 0.58,
+        "one_way": "#00ff66", "one_way_weight": 2.0, "one_way_opacity": 0.9,
+        "forward": "#b900ff", "backward": "#ff00c8", "trace_weight": 2.1, "trace_opacity": .7,
+        "glow": "#8c00ff", "glow_opacity": .30, "route": "#ff00f5",
+        "start": "#ff22f2", "goal": "#20eff2", "marker_ring": "white",
+        "legend_street": "CYAN",
+    },
+    "light": {
+        "scheme": "light", "bg": "#eef3f6",
+        "sidebar_bg": "rgba(248,251,252,.98)", "sidebar_border": "rgba(14,116,125,.28)",
+        "heading": "#0b1f27", "text": "#35505a", "accent": "#0e7c86",
+        "title": "#0b1f27", "title_shadow": "0 2px 18px rgba(255,255,255,.95)",
+        "badge_text": "#0b6b72", "badge_bg": "rgba(255,255,255,.88)", "badge_border": "rgba(14,116,125,.35)",
+        "metric_text": "#123943", "metric_border": "rgba(14,116,125,.25)",
+        "metric_bg": "rgba(14,116,125,.06)", "metric_value": "#04151b",
+        "input_bg": "#ffffff", "input_text": "#0b1f27", "input_border": "rgba(14,116,125,.38)",
+        "menu_bg": "#ffffff", "menu_hover": "rgba(14,116,125,.10)",
+        "street": "#2f8f9a", "street_weight": 1.05, "street_opacity": 0.62,
+        "one_way": "#0a9f4a", "one_way_weight": 2.0, "one_way_opacity": 0.9,
+        "forward": "#7c3aed", "backward": "#d6249f", "trace_weight": 2.0, "trace_opacity": .55,
+        "glow": "#7c3aed", "glow_opacity": .22, "route": "#c0007a",
+        "start": "#d6249f", "goal": "#0e9fb0", "marker_ring": "#0b1f27",
+        "legend_street": "TEAL",
+    },
+}
 
 @st.cache_resource(show_spinner=False)
 def get_graph(bbox):
@@ -52,21 +93,40 @@ def geo_line(graph: Graph, edge):
         [target.x, target.y]
     ]
 
+class LinesLayer(MacroElement):
+    _template = Template("""
+        {% macro script(this, kwargs) %}
+        (function () {
+            var lines = JSON.parse({{ this.payload }}), rings = new Array(lines.length);
+            for (var i = 0; i < lines.length; i++) {
+                var line = lines[i], ring = new Array(line.length / 2);
+                for (var j = 0; j < line.length; j += 2) {
+                    ring[j / 2] = [line[j + 1], line[j]];
+                }
+                rings[i] = ring;
+            }
+            L.polyline(rings, {{ this.options }}).addTo({{ this._parent.get_name() }});
+        })();
+        {% endmacro %}
+    """)
+
+    def __init__(self, lines, **options):
+        super().__init__()
+        self._name = "LinesLayer"
+        flat = [[round(value, 6) for point in line for value in point] for line in lines]
+        self.payload = json.dumps(json.dumps(flat, separators=(",", ":")))
+        self.options = json.dumps({**options, "interactive": False})
+
 def add_lines(map_object, lines, color, weight, opacity):
     if lines:
-        folium.GeoJson(
-            {
-                "type": "MultiLineString",
-                "coordinates": lines
-            },
-            style_function=lambda _: {
-                "color": color,
-                "weight": weight,
-                "opacity": opacity,
-            }
+        LinesLayer(
+            lines,
+            color=color,
+            weight=weight,
+            opacity=opacity,
         ).add_to(map_object)
 
-def create_map(bbox):
+def create_map(bbox, palette):
     north, south, east, west = bbox
 
     center_lat = (north + south) / 2
@@ -81,7 +141,7 @@ def create_map(bbox):
 
     map_object.get_root().header.add_child(
         folium.Element(
-            "<style>.leaflet-container{background:#020508!important}</style>"
+            f"<style>.leaflet-container{{background:{palette['bg']}!important}}</style>"
         )
     )
 
@@ -90,7 +150,7 @@ def create_map(bbox):
     map_object.fit_bounds([[south, west], [north, east]])
     return map_object
 
-def add_network(map_object, graph):
+def add_network(map_object, graph, palette):
     lines = [
         geo_line(graph, edge)
         for edges in graph.adj.values()
@@ -100,9 +160,9 @@ def add_network(map_object, graph):
     add_lines(
         map_object,
         lines,
-        "#21e6e6",
-        1.15,
-        0.58
+        palette["street"],
+        palette["street_weight"],
+        palette["street_opacity"]
     )
 
 def bearing_degrees(source, target):
@@ -119,7 +179,7 @@ def bearing_degrees(source, target):
 
     return (math.degrees(math.atan2(x, y)) + 360) % 360
 
-def add_one_way_roads(map_object, graph, min_gap_m=120, min_edge_m=40):
+def add_one_way_roads(map_object, graph, palette, min_gap_m=120, min_edge_m=40):
     M_PER_DEG = 111_320
     cell = min_gap_m / M_PER_DEG          # grid cell size in degrees
     occupied = set()
@@ -167,9 +227,15 @@ def add_one_way_roads(map_object, graph, min_gap_m=120, min_edge_m=40):
         shafts.append([tail, tip])
         heads.append([left, tip, right])   # one polyline, not two
 
-    add_lines(map_object, shafts + heads, "#00ff66", 2.0, 0.9)
+    add_lines(
+        map_object,
+        shafts + heads,
+        palette["one_way"],
+        palette["one_way_weight"],
+        palette["one_way_opacity"]
+    )
 
-def add_search_trace(map_object, graph: Graph):
+def add_search_trace(map_object, graph: Graph, palette):
     trace = st.session_state.trace
 
     if not trace:
@@ -217,20 +283,20 @@ def add_search_trace(map_object, graph: Graph):
     add_lines(
         map_object,
         forward_lines,
-        "#b900ff",
-        2.1,
-        .7
+        palette["forward"],
+        palette["trace_weight"],
+        palette["trace_opacity"]
     )
 
     add_lines(
         map_object,
         backward_lines,
-        "#ff00c8",
-        2.1,
-        .7
+        palette["backward"],
+        palette["trace_weight"],
+        palette["trace_opacity"]
     )
 
-def add_route(map_object, graph: Graph):
+def add_route(map_object, graph: Graph, palette):
     if not st.session_state.path:
         return
 
@@ -241,27 +307,27 @@ def add_route(map_object, graph: Graph):
 
     folium.PolyLine(
         route,
-        color="#8c00ff",
+        color=palette["glow"],
         weight=12,
-        opacity=.30
+        opacity=palette["glow_opacity"]
     ).add_to(map_object)
 
     folium.PolyLine(
         route,
-        color="#ff00f5",
+        color=palette["route"],
         weight=4,
         opacity=1
     ).add_to(map_object)
 
-def add_markers(map_object):
+def add_markers(map_object, palette):
     for point, label, color in [
-        (st.session_state.start, "Start", "#ff22f2"),
-        (st.session_state.goal, "Goal", "#20eff2")
+        (st.session_state.start, "Start", palette["start"]),
+        (st.session_state.goal, "Goal", palette["goal"])
     ]:
         folium.CircleMarker(
             point,
             radius=8,
-            color="white",
+            color=palette["marker_ring"],
             weight=2,
             fill=True,
             fill_color=color,
@@ -318,18 +384,23 @@ def add_scenario(map_object, graph: Graph, config: ScenarioConfig):
     add_rain_cells(map_object, config.rain_cells)
     add_blocked_roads(map_object, graph)
 
-def build_map(graph, config, show_directions=False):
-    map_object = create_map(BBOX)
+def build_base_map(graph, palette):
+    map_object = create_map(BBOX, palette)
 
-    add_network(map_object, graph)
-    add_one_way_roads(map_object, graph)
-
-    add_scenario(map_object, graph, config)
-    add_search_trace(map_object, graph)
-    add_route(map_object, graph)
-    add_markers(map_object)
+    add_network(map_object, graph, palette)
+    add_one_way_roads(map_object, graph, palette)
 
     return map_object
+
+def build_overlay(graph, config, palette):
+    overlay = folium.FeatureGroup(name="overlay", control=False)
+
+    add_scenario(overlay, graph, config)
+    add_search_trace(overlay, graph, palette)
+    add_route(overlay, graph, palette)
+    add_markers(overlay, palette)
+
+    return overlay
 
 def run_route(graph, generator):
     generator.apply(graph)
@@ -415,19 +486,47 @@ def get_stats(graph: Graph, path, trace):
             "expanded": len(trace["forward"] | trace["backward"]), "roads": roads}
 
 
-st.set_page_config(page_title="Bidirectional A* — HCMC", page_icon="✦", layout="wide", initial_sidebar_state="expanded")
-st.markdown("""
+PAGE_CSS = CssTemplate("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;600&family=Playfair+Display:wght@500&display=swap');
-html,body,[data-testid="stAppViewContainer"],.stApp{background:#020508} footer,#MainMenu,[data-testid="stToolbar"],[data-testid="stDecoration"]{display:none!important}
-header[data-testid="stHeader"]{background:transparent!important;z-index:10001!important}.block-container{padding:0!important;max-width:none!important}
-section[data-testid="stSidebar"]{min-width:340px!important;width:340px!important;transform:translateX(0)!important;background:rgba(2,7,11,.97);border-right:1px solid rgba(33,230,230,.28)}
+:root{color-scheme:$scheme}
+html,body,[data-testid="stAppViewContainer"],[data-testid="stMain"],.stApp{background:$bg}
+footer,#MainMenu,[data-testid="stToolbar"],[data-testid="stDecoration"]{display:none!important}
+header[data-testid="stHeader"]{background:transparent!important;z-index:10001!important}
+.block-container{padding:0!important;max-width:none!important}
+section[data-testid="stSidebar"]{min-width:340px!important;width:340px!important;transform:translateX(0)!important;background:$sidebar_bg;border-right:1px solid $sidebar_border}
 section[data-testid="stSidebar"][aria-expanded="false"]{margin-left:0!important;transform:translateX(0)!important}
-[data-testid="stSidebar"] *{font-family:'DM Sans',sans-serif}[data-testid="stSidebar"] h2,[data-testid="stSidebar"] h3{color:#efffff}[data-testid="stSidebar"] p,[data-testid="stSidebar"] label{color:#9bc9cc}
+[data-testid="stSidebar"] *:not([data-testid="stIconMaterial"]){font-family:'DM Sans',sans-serif}
+[data-testid="stSidebar"] h2,[data-testid="stSidebar"] h3,[data-testid="stSidebar"] h4{color:$heading}
+[data-testid="stSidebar"] p,[data-testid="stSidebar"] label,[data-testid="stSidebar"] [data-testid="stWidgetLabel"] *{color:$text}
+[data-testid="stSidebar"] [data-testid="stIconMaterial"],[data-testid="stHeader"] button{color:$text}
 [data-testid="stSidebar"] .stButton button{background:linear-gradient(90deg,#aa00ff,#ff00c8);color:white;border:0;font-weight:700}
-.map-title{position:fixed;top:44px;right:4vw;z-index:9999;color:white;pointer-events:none;font-family:'Playfair Display',Georgia,serif;text-shadow:0 3px 24px #000}.map-title .city{font:600 11px 'DM Sans';letter-spacing:.22em;text-transform:uppercase;color:#21e6e6;margin-bottom:10px}.map-title .main{font-size:clamp(38px,4vw,68px);line-height:.98;letter-spacing:-.04em}.map-title .sub{font-size:clamp(25px,3vw,51px);line-height:1.06;margin-top:8px}
-.badge{position:fixed;left:360px;bottom:18px;z-index:9999;color:#8eeff1;background:rgba(0,8,13,.76);border:1px solid rgba(33,230,230,.3);border-radius:99px;padding:8px 13px;font:600 10px 'DM Sans';letter-spacing:.08em;pointer-events:none}.metric{color:#ddffff;border:1px solid rgba(33,230,230,.2);background:rgba(33,230,230,.05);border-radius:7px;padding:9px 11px;margin:7px 0}.metric b{float:right;color:white}@media(max-width:900px){.map-title{display:none}.badge{left:360px}} iframe{display:block;border:0!important}
-</style>""", unsafe_allow_html=True)
+[data-testid="stSidebar"] .stButton button p{color:white}
+[data-testid="stSidebar"] [data-testid="stSelectbox"] div:has(> input),[data-testid="stSidebar"] [data-testid="stNumberInputContainer"],[data-testid="stSidebar"] [data-baseweb="select"] > div,[data-testid="stSidebar"] [data-baseweb="input"],[data-testid="stSidebar"] [data-baseweb="base-input"]{background:$input_bg!important;border-color:$input_border!important}
+[data-testid="stSidebar"] [data-testid="stSelectbox"] *,[data-testid="stSidebar"] [data-baseweb="select"] *,[data-testid="stSidebar"] [data-testid="stNumberInput"] input,[data-testid="stSidebar"] [data-testid="stNumberInput"] button{color:$input_text!important;-webkit-text-fill-color:$input_text}
+[data-testid="stSidebar"] [data-testid="stSelectbox"] label *,[data-testid="stSidebar"] [data-testid="stNumberInput"] label *{color:$text!important;-webkit-text-fill-color:$text}
+[data-testid="stSidebar"] [data-testid="stNumberInput"] button{background:$input_bg!important}
+[data-testid="stSelectboxVirtualDropdown"],[data-baseweb="popover"] [data-baseweb="menu"],[data-baseweb="popover"] ul{background:$menu_bg!important}
+[data-testid="stSelectboxVirtualDropdown"] *,[data-baseweb="popover"] li,[data-baseweb="popover"] li *{color:$input_text!important}
+[data-testid="stSelectboxVirtualDropdown"] [role="option"]:hover > div,[data-baseweb="popover"] li:hover,[data-baseweb="popover"] li[aria-selected="true"]{background:$menu_hover!important}
+[data-testid="stSidebar"] [data-testid="stSliderThumbValue"],[data-testid="stSidebar"] [data-testid="stSliderTickBar"] *{color:$text!important}
+[data-testid="stSidebar"] [data-testid="stExpander"] details{border:1px solid $metric_border;background:$metric_bg;border-radius:7px}
+[data-testid="stSidebar"] [data-testid="stExpander"] summary{background:transparent!important}
+[data-testid="stSidebar"] [data-testid="stExpander"] summary *{color:$text!important}
+.map-title{position:fixed;top:44px;right:4vw;z-index:9999;color:$title;pointer-events:none;font-family:'Playfair Display',Georgia,serif;text-shadow:$title_shadow}
+.map-title .city{font:600 11px 'DM Sans';letter-spacing:.22em;text-transform:uppercase;color:$accent;margin-bottom:10px}
+.map-title .main{font-size:clamp(38px,4vw,68px);line-height:.98;letter-spacing:-.04em}
+.map-title .sub{font-size:clamp(25px,3vw,51px);line-height:1.06;margin-top:8px}
+.badge{position:fixed;left:360px;bottom:18px;z-index:9999;color:$badge_text;background:$badge_bg;border:1px solid $badge_border;border-radius:99px;padding:8px 13px;font:600 10px 'DM Sans';letter-spacing:.08em;pointer-events:none}
+.metric{color:$metric_text;border:1px solid $metric_border;background:$metric_bg;border-radius:7px;padding:9px 11px;margin:7px 0}
+.metric b{float:right;color:$metric_value}
+.road-list{font-size:.82rem;line-height:1.65;color:$text;max-height:320px;overflow-y:auto;padding-right:6px}
+@media(max-width:900px){.map-title{display:none}.badge{left:360px}}
+iframe{display:block;border:0!important}
+</style>""")
+
+
+st.set_page_config(page_title="Bidirectional A* — HCMC", page_icon="✦", layout="wide", initial_sidebar_state="expanded")
 
 defaults = {
     "start": LANDMARKS["Đại học Bách Khoa"],
@@ -471,11 +570,17 @@ defaults = {
     ),
 
     "scenario_seed": 42,
+
+    "dark_mode": True,
 }
 
 for key, value in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = value
+
+theme = "dark" if st.session_state.dark_mode else "light"
+palette = THEMES[theme]
+st.markdown(PAGE_CSS.substitute(palette), unsafe_allow_html=True)
 
 # Give each hotspot a stable ID for its widget keys.
 # This prevents editing/removing one hotspot from mixing up
@@ -527,23 +632,17 @@ if not st.session_state.demo_done:
 # Sidebar
 # ============================================================
 
-with st.sidebar:
-    st.markdown("## Route explorer")
-    st.caption("Bidirectional A* using the HCMC road network.")
-
-    st.write(
-        f"**{len(graph.vertices):,}** nodes · "
-        f"**{sum(map(len, graph.adj.values())):,}** edges"
-    )
-
+@st.fragment
+def route_controls():
     # --------------------------------------------------------
     # Route selection
     # --------------------------------------------------------
 
-    click_mode = st.radio(
+    st.radio(
         "Map click sets",
         ["Start", "Goal"],
         horizontal=True,
+        key="click_mode",
     )
 
     names = list(LANDMARKS)
@@ -581,6 +680,8 @@ with st.sidebar:
         st.session_state.path = None
         st.session_state.trace = None
         st.session_state.route_stats = None
+
+        st.rerun()
 
     # --------------------------------------------------------
     # Scenario configuration
@@ -640,6 +741,7 @@ with st.sidebar:
     hotspot_ids = st.session_state.hotspot_ids
 
     remove_hotspot_id = None
+    scenario_changed = False
 
     if not config.hotspots:
         st.caption("No hotspots configured.")
@@ -689,6 +791,9 @@ with st.sidebar:
                 step=0.05,
                 key=f"hotspot_intensity_{hotspot_id}",
             )
+
+            if (hotspot.lat, hotspot.lon, hotspot.radius, hotspot.intensity) != (lat, lon, radius, intensity):
+                scenario_changed = True
 
             # Keep the persistent config synchronized with
             # the hotspot widgets.
@@ -833,6 +938,15 @@ with st.sidebar:
                     "West longitude must be smaller than east longitude."
                 )
 
+            if (
+                rain_cell.min_lat,
+                rain_cell.max_lat,
+                rain_cell.min_lon,
+                rain_cell.max_lon,
+                rain_cell.weather_factor,
+            ) != (min_lat, max_lat, min_lon, max_lon, weather_factor):
+                scenario_changed = True
+
             # Keep persistent configuration synchronized.
             rain_cell.min_lat = min_lat
             rain_cell.max_lat = max_lat
@@ -892,6 +1006,9 @@ with st.sidebar:
         st.session_state.trace = None
         st.session_state.route_stats = None
 
+        st.rerun()
+
+    if scenario_changed:
         st.rerun()
 
     seed = st.number_input(
@@ -961,8 +1078,28 @@ with st.sidebar:
         )
 
         with st.expander("Road sequence"):
-            for index, road in enumerate(info["roads"], 1):
-                st.caption(f"{index:02d}  {road}")
+            road_list = "<br>".join(
+                f"{index:02d}&nbsp;&nbsp;{html.escape(road)}"
+                for index, road in enumerate(info["roads"], 1)
+            )
+            st.markdown(
+                f'<div class="road-list">{road_list}</div>',
+                unsafe_allow_html=True,
+            )
+
+
+with st.sidebar:
+    st.markdown("## Route explorer")
+    st.caption("Bidirectional A* using the HCMC road network.")
+
+    st.write(
+        f"**{len(graph.vertices):,}** nodes · "
+        f"**{sum(map(len, graph.adj.values())):,}** edges"
+    )
+
+    st.toggle("Dark mode", key="dark_mode")
+
+    route_controls()
 
 
 # ============================================================
@@ -979,9 +1116,14 @@ st.markdown(
 )
 
 output = st_folium(
-    build_map(
+    build_base_map(
+        graph,
+        palette,
+    ),
+    feature_group_to_add=build_overlay(
         graph,
         st.session_state.scenario_config,
+        palette,
     ),
     height=850,
     use_container_width=True,
@@ -996,7 +1138,7 @@ output = st_folium(
 
 st.markdown(
     f'<div class="badge">'
-    f'CYAN · STREET NETWORK&nbsp;&nbsp;&nbsp; '
+    f'{palette["legend_street"]} · STREET NETWORK&nbsp;&nbsp;&nbsp; '
     f'MAGENTA · SEARCH + ROUTE&nbsp;&nbsp;&nbsp; '
     f'{len(graph.vertices):,} NODES'
     f'</div>',
@@ -1014,7 +1156,6 @@ if clicked:
     signature = (
         round(clicked["lat"], 6),
         round(clicked["lng"], 6),
-        click_mode,
     )
 
     if signature != st.session_state.clicked:
@@ -1023,7 +1164,7 @@ if clicked:
             clicked["lng"],
         )
 
-        if click_mode == "Start":
+        if st.session_state.get("click_mode", "Start") == "Start":
             st.session_state.start = point
             st.session_state.start_name = "Custom map point"
         else:

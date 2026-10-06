@@ -1,0 +1,15 @@
+.venv/
+.venv*/
+venv/
+env/
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+.DS_Store
+
+# Large local source-data and generated cache folders
+archive/
+data/
+cache/
