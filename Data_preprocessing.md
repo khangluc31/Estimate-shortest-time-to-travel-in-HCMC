@@ -2,92 +2,234 @@
 
 ## 1. Overview
 
-This module builds a road graph from **OpenStreetMap** using OSMnx and assigns a simulated traffic scenario to the roads.
+This module builds a traffic graph from the **Ho Chi Minh City traffic-flow dataset** provided as CSV files and generates simulated traffic, weather, and road-incident conditions for the network.
+
+The dataset is available from Kaggle:
+
+**Traffic Flow Data in Ho Chi Minh City, Viet Nam**
+
+https://www.kaggle.com/datasets/thanhnguyen2612/traffic-flow-data-in-ho-chi-minh-city-viet-nam/data
 
 The module has two main responsibilities:
 
 1. **Build the road network**
 
-   * Download a drivable road network from OpenStreetMap.
-   * Convert OSM nodes into `Vertex` objects.
-   * Convert OSM road segments into `Edge` objects.
-   * Store the graph in a custom `Graph` structure.
+   * Load road nodes from `nodes.csv`.
+   * Load directed road segments from `segments.csv`.
+   * Convert CSV records into `Vertex` and `Edge` objects.
+   * Optionally restrict the graph to a geographic bounding box.
+   * Remove invalid road segments.
+   * Keep only the shortest parallel edge between the same source and target.
+   * Store the resulting network in the custom `Graph` structure.
 
 2. **Generate traffic scenarios**
 
-   * Assign a baseline traffic density to every road.
-   * Increase density around predefined congestion hotspots.
-   * Add small random variations between roads.
-   * Randomly block some roads to simulate incidents.
+   * Assign baseline traffic density.
+   * Increase density around congestion hotspots.
+   * Add small random density variations.
+   * Randomly block roads to simulate incidents.
+   * Apply a global weather factor.
+   * Apply localized rain cells.
 
-The resulting graph can then be used by the A* pathfinding algorithm.
+The resulting graph is used by the A* pathfinding algorithm to estimate travel time.
 
 ---
 
 # 2. Overall Data Flow
 
 ```text
-OpenStreetMap
-     │
-     ▼
-OSMnx graph_from_bbox()
-     │
-     ▼
-load_graph()
-     │
-     ├── Vertex objects
-     └── Edge objects
-              │
-              ▼
+Kaggle Traffic Dataset
+        │
+        ▼
+    CSV Files
+        │
+        ├── nodes.csv
+        │
+        └── segments.csv
+        │
+        ▼
+    load_graph()
+        │
+        ├── Vertex objects
+        │
+        └── Edge objects
+                │
+                ▼
+             Graph
+                │
+                ▼
        ScenarioGenerator
-              │
-       ┌──────┴─────────┐
-       ▼                ▼
-  Traffic density   Road incidents
-       │                │
-       └──────┬─────────┘
-              ▼
-        Updated Graph
-              │
-              ▼
-        A* pathfinding
+                │
+        ┌───────┼────────────┐
+        │       │            │
+        ▼       ▼            ▼
+     Traffic  Incidents   Weather
+     density              conditions
+        │       │            │
+        └───────┼────────────┘
+                ▼
+          Updated Graph
+                │
+                ▼
+          A* pathfinding
+                │
+                ▼
+       Estimated travel time
 ```
+
+The module performs all data loading locally from the supplied CSV files. No external road-network API is required at runtime.
 
 ---
 
-# 3. Constants
+# 3. Input CSV Files
 
-```python
-DEFAULT_SPEED = 40
-MIN_SPEED_FACTOR = 0.05
+The graph loader uses two CSV files:
+
+```text
+nodes.csv
+segments.csv
 ```
 
-### `DEFAULT_SPEED`
+## 3.1 `nodes.csv`
 
-Default road speed in km/h when OpenStreetMap does not provide a `maxspeed` value.
+`nodes.csv` contains the geographic nodes of the road network.
+
+The loader expects the following columns:
+
+```text
+_id
+long
+lat
+```
+
+These values are converted into `Vertex` objects.
 
 For example:
 
 ```text
-OSM maxspeed exists → use OSM value
-OSM maxspeed missing → use 40 km/h
+_id       long        lat
+123456    106.7000    10.7800
 ```
 
-### `MIN_SPEED_FACTOR`
+becomes:
 
-Prevents a road's calculated speed from reaching zero.
+```python
+Vertex(
+    id=123456,
+    x=106.7000,
+    y=10.7800
+)
+```
 
-The minimum speed is:
+The coordinate convention used by the program is:
 
 ```text
-minimum speed = speed_limit × 0.05
+x = longitude
+y = latitude
 ```
-
-This is important because `travel_time` divides by the current speed.
 
 ---
 
-# 4. Vertex
+## 3.2 `segments.csv`
+
+`segments.csv` contains the directed road segments connecting the nodes.
+
+The loader uses the following fields:
+
+```text
+s_node_id
+e_node_id
+length
+max_velocity
+street_name
+```
+
+These are mapped to the `Edge` representation:
+
+```text
+s_node_id     → source
+e_node_id     → target
+length        → length
+max_velocity  → speed_limit
+street_name   → name
+```
+
+The source and target define the direction of the edge:
+
+```text
+source → target
+```
+
+For example:
+
+```text
+s_node_id = 100
+e_node_id = 200
+```
+
+creates:
+
+```text
+100 → 200
+```
+
+---
+
+# 4. Constants
+
+```python
+DEFAULT_SPEED = 40.0
+MIN_SPEED_FACTOR = 0.05
+```
+
+## `DEFAULT_SPEED`
+
+`DEFAULT_SPEED` is the fallback speed limit in km/h when `max_velocity` in `segments.csv` is missing or invalid.
+
+The loading logic is:
+
+```text
+Valid max_velocity
+        │
+        ▼
+   use that value
+
+Missing/invalid max_velocity
+        │
+        ▼
+   use 40 km/h
+```
+
+Therefore:
+
+```python
+DEFAULT_SPEED = 40.0
+```
+
+ensures that every valid road segment has a usable speed limit.
+
+---
+
+## `MIN_SPEED_FACTOR`
+
+`MIN_SPEED_FACTOR` prevents the effective road speed from becoming zero.
+
+```python
+MIN_SPEED_FACTOR = 0.05
+```
+
+The minimum allowed speed is therefore:
+
+```text
+minimum speed
+    = speed_limit × 0.05
+```
+
+This is important because `travel_time` divides the road length by the current speed.
+
+---
+
+# 5. Vertex
 
 ```python
 @dataclass
@@ -97,13 +239,13 @@ class Vertex:
     y: float
 ```
 
-Represents a node/intersection in the road network.
+A `Vertex` represents a node in the road network.
 
-| Attribute | Meaning               |
-| --------- | --------------------- |
-| `id`      | OpenStreetMap node ID |
-| `x`       | Longitude             |
-| `y`       | Latitude              |
+| Attribute | Meaning                  |
+| --------- | ------------------------ |
+| `id`      | Node ID from `nodes.csv` |
+| `x`       | Longitude                |
+| `y`       | Latitude                 |
 
 Example:
 
@@ -115,9 +257,16 @@ Vertex(
 )
 ```
 
+The geographic coordinate convention is:
+
+```text
+Vertex.x → longitude
+Vertex.y → latitude
+```
+
 ---
 
-# 5. Edge
+# 6. Edge
 
 ```python
 @dataclass
@@ -126,36 +275,83 @@ class Edge:
     target: int
     length: float
     speed_limit: float
-    oneway: bool = False
     name: str = ""
-    geometry: list = field(default_factory=list)
+    midpoint: tuple[float, float] = (0.0, 0.0)
+
     density: float = 0.0
     weather_factor: float = 1.0
     blocked: bool = False
 ```
 
-An `Edge` represents a directed road segment from one vertex to another.
+An `Edge` represents a directed road segment:
+
+```text
+source ─────────→ target
+```
 
 ## Main attributes
 
-| Attribute        |        Unit | Meaning                               |
-| ---------------- | ----------: | ------------------------------------- |
-| `source`         |     node ID | Starting vertex                       |
-| `target`         |     node ID | Ending vertex                         |
-| `length`         |      meters | Road length                           |
-| `speed_limit`    |        km/h | Maximum/legal speed used by the model |
-| `oneway`         |     boolean | Whether the road is one-way           |
-| `name`           |        text | Road name                             |
-| `geometry`       | coordinates | Shape used for displaying the road    |
-| `density`        |         0–1 | Traffic density                       |
-| `weather_factor` |         0–1 | Weather multiplier                    |
-| `blocked`        |     boolean | Whether the road is unavailable       |
+| Attribute        |         Unit | Meaning                              |
+| ---------------- | -----------: | ------------------------------------ |
+| `source`         |      node ID | Starting vertex                      |
+| `target`         |      node ID | Ending vertex                        |
+| `length`         |       meters | Length of the road segment           |
+| `speed_limit`    |         km/h | Static speed limit used by the model |
+| `name`           |         text | Road/street name                     |
+| `midpoint`       | `(lat, lon)` | Geographic midpoint of the segment   |
+| `density`        |          0–1 | Dynamic traffic density              |
+| `weather_factor` |         0–1+ | Dynamic weather multiplier           |
+| `blocked`        |      boolean | Whether the road is unavailable      |
 
 ---
 
-# 6. Traffic Density
+# 7. Edge Midpoint
 
-Density is represented as a value between `0` and `1`.
+The midpoint is calculated while loading `segments.csv`.
+
+For an edge connecting:
+
+```text
+source = (lat₁, lon₁)
+target = (lat₂, lon₂)
+```
+
+the midpoint is:
+
+```text
+midpoint latitude
+    = (lat₁ + lat₂) / 2
+
+midpoint longitude
+    = (lon₁ + lon₂) / 2
+```
+
+The code stores it as:
+
+```python
+midpoint = (
+    (source_vertex.y + target_vertex.y) / 2.0,
+    (source_vertex.x + target_vertex.x) / 2.0
+)
+```
+
+Therefore:
+
+```text
+edge.midpoint = (latitude, longitude)
+```
+
+The midpoint is later used for:
+
+* congestion hotspot calculations
+* rain-cell detection
+* geographic scenario generation
+
+---
+
+# 8. Traffic Density
+
+Traffic density is represented as a value between `0` and `1`.
 
 ```text
 0.0 → essentially empty
@@ -165,34 +361,35 @@ Density is represented as a value between `0` and `1`.
 1.0 → maximum congestion
 ```
 
-The current scenario generator intentionally keeps the maximum below `1.0`.
+The scenario generator limits density to:
 
-For example:
+```python
+0.0 ≤ density ≤ max_density
+```
+
+with the default:
 
 ```python
 max_density = 0.9
 ```
 
-This prevents almost every congested road from immediately reaching the minimum speed floor.
+Therefore, the default scenario does not generate a density of exactly `1.0`.
 
 ---
 
-# 7. Current Speed
+# 9. Current Speed
 
-The current speed of an edge is calculated using:
+The current speed of an edge is calculated from three factors:
+
+1. Static speed limit
+2. Traffic density
+3. Weather factor
+
+The implementation is:
 
 ```python
-speed = speed_limit * (1 - density)
-speed *= weather_factor
-```
-
-Then:
-
-```python
-max(
-    speed,
-    speed_limit * MIN_SPEED_FACTOR
-)
+speed = self.speed_limit * (1.0 - self.density)
+speed *= self.weather_factor
 ```
 
 Therefore:
@@ -204,9 +401,28 @@ current_speed
       × weather_factor
 ```
 
-subject to the minimum speed constraint.
+A minimum speed constraint is then applied:
 
-### Example
+```python
+return max(
+    speed,
+    self.speed_limit * MIN_SPEED_FACTOR
+)
+```
+
+Thus:
+
+```text
+current_speed
+    = max(
+        speed_limit × (1 - density) × weather_factor,
+        speed_limit × 0.05
+      )
+```
+
+---
+
+## Example
 
 Suppose:
 
@@ -219,60 +435,96 @@ weather_factor = 0.8
 Then:
 
 ```text
-40 × (1 - 0.5) × 0.8
+speed
+= 40 × (1 - 0.5) × 0.8
 = 16 km/h
 ```
 
-So the road is currently estimated to travel at `16 km/h`.
+Therefore:
+
+```text
+current_speed = 16 km/h
+```
 
 ---
 
-# 8. Travel Time
+# 10. Travel Time
 
 `travel_time` returns the estimated travel time in seconds.
 
+The implementation is:
+
 ```python
-travel_time = length / (current_speed / 3.6)
+return self.length / (self.current_speed / 3.6)
 ```
 
-The conversion:
+The conversion is:
 
 ```text
 km/h ÷ 3.6 = m/s
 ```
 
-is necessary because `length` is stored in meters.
+because edge length is stored in meters.
 
-### Example
+Therefore:
 
-For:
+```text
+travel_time
+    = length / speed_m_per_s
+```
+
+---
+
+## Example
+
+Suppose:
 
 ```text
 length = 500 m
 current_speed = 20 km/h
 ```
 
-we get:
+Convert speed:
 
 ```text
-20 / 3.6 = 5.56 m/s
-
-500 / 5.56 ≈ 90 seconds
+20 / 3.6
+≈ 5.56 m/s
 ```
+
+Then:
+
+```text
+travel_time
+= 500 / 5.56
+≈ 90 seconds
+```
+
+---
+
+## Blocked Edges
 
 If an edge is blocked:
 
 ```python
-travel_time = math.inf
+if self.blocked:
+    return math.inf
 ```
 
-This makes it unusable by the routing algorithm.
+Therefore:
+
+```text
+blocked edge
+    ↓
+travel_time = ∞
+```
+
+This makes the edge effectively unusable by the routing algorithm.
 
 ---
 
-# 9. Graph
+# 11. Graph
 
-The custom `Graph` class stores the road network.
+The custom `Graph` class stores the complete road network.
 
 ```python
 class Graph:
@@ -282,23 +534,35 @@ class Graph:
     self.v_max
 ```
 
-## `vertices`
+---
+
+## 11.1 `vertices`
 
 ```python
-id -> Vertex
+id → Vertex
 ```
 
-Stores all nodes.
+Stores the vertices in the graph.
 
-## `adj`
+Example:
+
+```text
+123 → Vertex(...)
+456 → Vertex(...)
+789 → Vertex(...)
+```
+
+---
+
+## 11.2 `adj`
+
+The forward adjacency structure is:
 
 ```text
 source → target → Edge
 ```
 
-Used for forward graph traversal.
-
-Example:
+For example:
 
 ```text
 A → B
@@ -306,176 +570,611 @@ A → C
 B → D
 ```
 
-## `radj`
+allows the routing algorithm to find all outgoing edges from a node.
 
-Reverse adjacency structure:
+The method:
+
+```python
+neighbors(u)
+```
+
+returns the outgoing edges from `u`.
+
+---
+
+## 11.3 `radj`
+
+`radj` is the reverse adjacency structure:
 
 ```text
 target → source → Edge
 ```
 
-This is useful when performing a backward search from the destination.
+It stores incoming edges.
 
-## `v_max`
-
-Maximum speed limit found in the graph.
-
-```python
-self.v_max = max(self.v_max, e.speed_limit)
-```
-
-This is particularly important for the A* heuristic.
-
-For a time-based heuristic:
+For example, if:
 
 ```text
-h(n) = distance(n, goal) / v_max
+A → B
+C → B
 ```
 
-`v_max` provides the fastest possible speed assumed by the heuristic.
+then:
+
+```text
+radj[B]
+    ├── A → Edge
+    └── C → Edge
+```
+
+The method:
+
+```python
+predecessors(v)
+```
+
+returns incoming edges to `v`.
+
+This structure is useful for backward or bidirectional pathfinding algorithms.
 
 ---
 
-# 10. Loading the OSM Graph
+## 11.4 `get_edge`
+
+The method:
 
 ```python
-load_graph(bbox)
+get_edge(u, v)
 ```
 
-This function downloads a drivable road network from OpenStreetMap:
+returns the edge from `u` to `v`, if one exists.
+
+Conceptually:
+
+```text
+get_edge(A, B)
+       ↓
+A → B
+```
+
+---
+
+# 12. Maximum Graph Speed
+
+The graph stores:
 
 ```python
-G = ox.graph_from_bbox(
-    bbox,
-    network_type="drive"
+self.v_max
+```
+
+which represents the maximum static speed limit among all retained edges.
+
+When an edge is added:
+
+```python
+self.v_max = max(
+    self.v_max,
+    edge.speed_limit
 )
 ```
 
-It then converts the OSMnx graph into the custom `Graph` structure.
-
-## Processing steps
+Therefore:
 
 ```text
-OSMnx graph
-    │
-    ├── Nodes → Vertex
-    │
-    └── Edges → Edge
-             │
-             ├── length
-             ├── maxspeed
-             ├── name
-             └── geometry
+v_max = maximum edge.speed_limit
 ```
+
+Importantly, `v_max` is based on the **static speed limits**, not the dynamically reduced current speeds.
 
 ---
 
-# 11. Speed Parsing
+# 13. A* Heuristic
 
-```python
-parse_maxspeed(raw)
-```
+`v_max` is useful for the time-based A* heuristic.
 
-OpenStreetMap speed values are not always stored in one consistent format.
-
-The function handles values such as:
+A basic time heuristic can be expressed as:
 
 ```text
-40
-40 km/h
-40;50
-30 mph
+h(n)
+    = distance(n, goal) / v_max
 ```
 
-and converts mph to km/h.
+The idea is that `v_max` represents the fastest static speed available in the graph.
 
-If no usable speed is found:
+Because the heuristic assumes a very fast possible travel speed, it provides a lower-bound estimate of the time required to reach the destination.
 
-```python
-DEFAULT_SPEED
-```
-
-is returned.
-
-For multiple speed values, the smallest value is currently used.
+The geographic distance is calculated using the Haversine formula described later in this document.
 
 ---
 
-# 12. Road Geometry
+# 14. Loading the Graph
 
-Each edge stores its geometry as:
+The graph is loaded using:
 
 ```python
-[(latitude, longitude), ...]
+load_graph(data_dir, bbox=None)
 ```
 
-This is used when drawing the calculated route on a map.
+where:
 
-If OSM does not provide explicit geometry, the module creates a straight line between the source and target vertices.
+```text
+data_dir
+    → directory containing nodes.csv and segments.csv
+
+bbox
+    → optional geographic bounding box
+```
 
 ---
 
-# 13. Parallel Edges
+# 15. Graph Loading Process
 
-OpenStreetMap can contain multiple edges between the same pair of nodes.
+The complete loading process is:
+
+```text
+nodes.csv
+    │
+    ▼
+load_nodes()
+    │
+    ▼
+Vertex objects
+    │
+    │
+segments.csv
+    │
+    ▼
+Validate segments
+    │
+    ├── BBOX filtering
+    ├── self-loop filtering
+    ├── length validation
+    └── speed validation
+    │
+    ▼
+Edge objects
+    │
+    ▼
+Remove longer parallel edges
+    │
+    ▼
+Determine used nodes
+    │
+    ▼
+Build Graph
+```
+
+---
+
+# 16. Loading Nodes
+
+The function:
+
+```python
+load_nodes(nodes_path)
+```
+
+reads `nodes.csv`.
+
+The expected columns are:
+
+```text
+_id
+long
+lat
+```
+
+Each row is converted into:
+
+```python
+Vertex(
+    id=node_id,
+    x=lon,
+    y=lat
+)
+```
+
+The resulting dictionary is:
+
+```text
+node_id → Vertex
+```
+
+---
+
+# 17. Bounding Box Filtering
+
+`load_graph()` optionally accepts:
+
+```python
+bbox=(north, south, east, west)
+```
+
+The bounding box format is:
+
+```text
+(north, south, east, west)
+```
+
+For example:
+
+```python
+bbox = (
+    10.777,
+    10.769,
+    106.702,
+    106.694
+)
+```
+
+A node is retained if:
+
+```text
+south ≤ latitude ≤ north
+
+west ≤ longitude ≤ east
+```
+
+The filtering is performed before processing road segments.
+
+---
+
+# 18. Bounding Box Validation
+
+The function:
+
+```python
+validate_bbox(bbox)
+```
+
+checks that the bounding box is valid.
+
+It verifies:
+
+1. Exactly four values are provided.
+2. Values are numeric.
+3. Values are finite.
+4. Latitude is between `-90` and `90`.
+5. Longitude is between `-180` and `180`.
+6. `north > south`.
+7. `east > west`.
+
+Invalid input raises a `ValueError`.
+
+If the bounding box contains no nodes from `nodes.csv`, `load_graph()` also raises an error.
+
+---
+
+# 19. Segment Validation
+
+Each row in `segments.csv` is validated before becoming an edge.
+
+## Source and target
+
+Both:
+
+```text
+s_node_id
+e_node_id
+```
+
+must exist in the spatially filtered node set.
+
+Otherwise the segment is skipped.
+
+---
+
+## Self-loops
+
+Segments where:
+
+```text
+source == target
+```
+
+are ignored.
+
+Therefore:
+
+```text
+A → A
+```
+
+is not added to the graph.
+
+---
+
+## Length
+
+The `length` field must be:
+
+* numeric
+* finite
+* greater than zero
+
+Invalid lengths are skipped.
+
+---
+
+# 20. Speed Parsing
+
+The current dataset provides speed through:
+
+```text
+max_velocity
+```
+
+The loader attempts:
+
+```python
+speed_limit = float(raw_speed)
+```
+
+If the value is missing or cannot be converted to a valid positive finite number:
+
+```python
+speed_limit = DEFAULT_SPEED
+```
+
+Therefore:
+
+```text
+valid max_velocity
+        ↓
+use dataset value
+
+invalid/missing max_velocity
+        ↓
+use 40 km/h
+```
+
+---
+
+# 21. Road Names
+
+The segment field:
+
+```text
+street_name
+```
+
+is stored as:
+
+```python
+edge.name
+```
+
+Whitespace is removed using:
+
+```python
+raw_name.strip()
+```
+
+Empty or invalid textual values such as:
+
+```text
+""
+"nan"
+"none"
+```
+
+are converted to:
+
+```text
+""
+```
+
+---
+
+# 22. Creating Edges
+
+For every valid segment, an `Edge` is created:
+
+```python
+Edge(
+    source=source,
+    target=target,
+    length=length,
+    speed_limit=speed_limit,
+    name=name,
+    midpoint=midpoint
+)
+```
+
+The dynamic scenario values initially use their defaults:
+
+```text
+density = 0.0
+weather_factor = 1.0
+blocked = False
+```
+
+These values are later modified by `ScenarioGenerator`.
+
+---
+
+# 23. Parallel Edges
+
+The input data may contain multiple segments with the same:
+
+```text
+source → target
+```
+
+pair.
+
+The loader keeps only the shortest one.
+
+The key is:
+
+```python
+key = (edge.source, edge.target)
+```
+
+The replacement rule is:
+
+```python
+if old is None or edge.length < old.length:
+    shortest_edges[key] = edge
+```
+
+Therefore:
+
+```text
+A → B = 100 m
+A → B = 80 m
+A → B = 120 m
+```
+
+results in:
+
+```text
+A → B = 80 m
+```
+
+This simplifies the graph to one retained edge for each directed source-target pair.
+
+---
+
+# 24. Used Nodes
+
+The loader does not automatically add every node inside the bounding box.
+
+After parallel edges have been filtered, it determines which nodes actually participate in the final graph.
+
+For every retained edge:
+
+```python
+used_nodes.add(edge.source)
+used_nodes.add(edge.target)
+```
+
+Only these nodes are added to the graph.
+
+Therefore:
+
+```text
+nodes.csv
+    ↓
+BBOX filtering
+    ↓
+valid segments
+    ↓
+retained segments
+    ↓
+only participating nodes
+```
+
+This prevents isolated nodes from being unnecessarily stored in the routing graph.
+
+---
+
+# 25. Directed Roads
+
+Edges are directed according to the source and target fields in `segments.csv`.
 
 For example:
 
 ```text
-A ───────→ B
-A ──→ B
+A → B
 ```
 
-The current implementation keeps the shortest edge:
+is stored as:
 
 ```python
-if old is None or edge.length < old.length:
-    g.add_edge(edge)
+Edge(
+    source=A,
+    target=B,
+    ...
+)
 ```
 
-This simplifies the graph structure to:
+If the dataset also contains:
 
-```python
-adj[source][target] = Edge
+```text
+B → A
 ```
 
-rather than keeping multiple parallel edges.
-
----
-
-# 14. One-Way Roads
-
-The graph stores roads as directed edges.
-
-For a two-way road:
+then the graph contains two directed edges:
 
 ```text
 A → B
 B → A
 ```
 
-For a one-way road:
+---
+
+# 26. Physical Road Grouping
+
+The function:
+
+```python
+roads(graph)
+```
+
+groups opposite-direction edges when assigning scenario values.
+
+Suppose the graph contains:
+
+```text
+A → B
+B → A
+```
+
+The two edges are treated as the two directions of the same physical road.
+
+The function uses:
+
+```python
+road_key = frozenset((u, v))
+```
+
+and tracks already processed road pairs.
+
+Therefore:
+
+```text
+A → B
+B → A
+```
+
+are processed once for scenario generation.
+
+If only:
 
 ```text
 A → B
 ```
 
-The `_roads()` helper identifies physical roads so that scenario values can be assigned consistently.
-
-For a two-way road, both directions receive the same:
-
-```text
-density
-blocked status
-```
-
-This prevents a single physical road from having contradictory traffic conditions in each direction.
+exists, it is treated as a single-direction road.
 
 ---
 
-# 15. Hotspots
+# 27. Scenario Model
 
-A hotspot represents an area with increased traffic congestion.
+The scenario model consists of three major dynamic conditions:
+
+```text
+Traffic density
+Weather
+Road incidents
+```
+
+These are stored directly on each `Edge`.
+
+```text
+edge.density
+edge.weather_factor
+edge.blocked
+```
+
+The scenario generator modifies these values without changing the underlying static road network.
+
+---
+
+# 28. Hotspots
+
+A `Hotspot` represents a geographic area with increased traffic congestion.
 
 ```python
 @dataclass
@@ -485,6 +1184,13 @@ class Hotspot:
     intensity: float = 1.0
     radius: float = 500.0
 ```
+
+| Attribute   | Meaning                      |
+| ----------- | ---------------------------- |
+| `lat`       | Hotspot latitude             |
+| `lon`       | Hotspot longitude            |
+| `intensity` | Maximum congestion influence |
+| `radius`    | Spatial spread in meters     |
 
 Example:
 
@@ -497,13 +1203,9 @@ Hotspot(
 )
 ```
 
-The hotspot does not directly assign one density value to every road.
-
-Instead, its influence decreases with distance.
-
 ---
 
-# 16. Hotspot Influence
+# 29. Hotspot Influence
 
 The function:
 
@@ -514,201 +1216,36 @@ hotspot_intensity(distance, hotspot)
 uses a Gaussian-style falloff:
 
 ```text
-influence =
-    intensity × exp(
-        -distance² / (2 × radius²)
-    )
+influence
+    = intensity
+      × exp(
+          -distance² / (2 × radius²)
+        )
 ```
 
-Therefore:
+The distance is measured using the Haversine formula.
+
+The result is:
 
 ```text
-distance from hotspot
-        │
-        ▼
-     closer
-        │
-        ▼
-higher congestion influence
+close to hotspot
+        ↓
+high influence
+
+far from hotspot
+        ↓
+low influence
 ```
 
-and:
-
-```text
-distance from hotspot
-        │
-        ▼
-      farther
-        │
-        ▼
-lower congestion influence
-```
-
-This creates a gradual congestion zone rather than a hard boundary.
+This creates a gradual congestion region instead of a hard boundary.
 
 ---
 
-# 17. ScenarioConfig
+# 30. Multiple Hotspots
 
-`ScenarioConfig` controls how traffic scenarios are generated.
+When multiple hotspots affect the same road, the implementation uses the **strongest hotspot influence**.
 
-```python
-@dataclass
-class ScenarioConfig:
-    base_density: float = 0.1
-    max_density: float = 0.9
-    density_deviation: float = 0.05
-    block_probability: float = 0.03
-    hotspots: list[Hotspot] = field(default_factory=list)
-```
-
-## Parameters
-
-### `base_density`
-
-Baseline traffic affecting **every road**.
-
-Example:
-
-```text
-base_density = 0.1
-```
-
-means that even roads outside hotspots have approximately 10% baseline density.
-
-This is important because the model does not assume that roads outside congestion hotspots are completely empty.
-
----
-
-### `max_density`
-
-Maximum density generated by the scenario.
-
-Example:
-
-```python
-max_density = 0.9
-```
-
-The final density is clamped to:
-
-```text
-0.0 ≤ density ≤ 0.9
-```
-
----
-
-### `density_deviation`
-
-Small random variation applied to every physical road.
-
-For:
-
-```python
-density_deviation = 0.05
-```
-
-the generator adds:
-
-```text
-random value between -0.05 and +0.05
-```
-
-This prevents roads with identical hotspot influence from always having exactly the same density.
-
----
-
-### `block_probability`
-
-Probability that a physical road is blocked.
-
-Example:
-
-```python
-block_probability = 0.03
-```
-
-means each physical road has a 3% probability of being blocked.
-
-Blocked roads have:
-
-```python
-travel_time = math.inf
-```
-
----
-
-### `hotspots`
-
-List of congestion hotspots.
-
-Example:
-
-```python
-hotspots = [
-    Hotspot(
-        lat=10.780,
-        lon=106.700,
-        intensity=1.0,
-        radius=500
-    ),
-    Hotspot(
-        lat=10.775,
-        lon=106.695,
-        intensity=0.7,
-        radius=300
-    )
-]
-```
-
----
-
-# 18. Density Generation
-
-For every physical road, density is calculated approximately as:
-
-```text
-density =
-    base_density
-    + hotspot contribution
-    + random local deviation
-```
-
-The hotspot contribution is:
-
-```text
-(max_density - base_density)
-× hotspot influence
-```
-
-The final value is clamped:
-
-```text
-density = max(
-    0,
-    min(max_density, density)
-)
-```
-
-Therefore, the intended model is:
-
-```text
-                         hotspot
-                            ↓
-                     high congestion
-                            │
-                            │
-low baseline ───────────────┼────────────── low baseline
-                            │
-                      decreasing
-                       influence
-```
-
----
-
-# 19. Multiple Hotspots
-
-If several hotspots affect the same road, the current implementation uses the **strongest hotspot**:
+The relevant logic is:
 
 ```python
 hotspot_effect = max(
@@ -717,22 +1254,246 @@ hotspot_effect = max(
 )
 ```
 
-It does **not** add hotspot influences together.
-
 For example:
 
 ```text
 Hotspot A influence = 0.7
 Hotspot B influence = 0.4
-
-final hotspot influence = 0.7
 ```
 
-This prevents overlapping hotspots from automatically pushing density beyond the intended range.
+produces:
+
+```text
+hotspot_effect = 0.7
+```
+
+The two influences are not added together.
 
 ---
 
-# 20. Random Seeds
+# 31. ScenarioConfig
+
+Scenario parameters are stored in:
+
+```python
+@dataclass
+class ScenarioConfig:
+    base_density: float = 0.1
+    max_density: float = 0.9
+    density_deviation: float = 0.05
+    hotspots: list[Hotspot] = field(default_factory=list)
+
+    block_probability: float = 0.01
+
+    global_weather_factor: float = 1.0
+    rain_cells: list[RainCell] = field(default_factory=list)
+```
+
+The configuration controls traffic, incidents, and weather.
+
+---
+
+# 32. Base Density
+
+```python
+base_density = 0.1
+```
+
+`base_density` is the starting traffic density for every physical road.
+
+For example:
+
+```text
+base_density = 0.1
+```
+
+means every road starts with:
+
+```text
+density = 0.1
+```
+
+before hotspot effects and random variation are applied.
+
+This means roads outside congestion hotspots are not assumed to have zero traffic.
+
+---
+
+# 33. Maximum Density
+
+```python
+max_density = 0.9
+```
+
+The generated density is clamped to:
+
+```text
+0.0 ≤ density ≤ 0.9
+```
+
+The maximum is applied after hotspot influence and random variation.
+
+---
+
+# 34. Density Deviation
+
+```python
+density_deviation = 0.05
+```
+
+A small random variation is added to each physical road.
+
+The generated value is:
+
+```python
+rng.uniform(
+    -cfg.density_deviation,
+    cfg.density_deviation
+)
+```
+
+Therefore, with:
+
+```text
+density_deviation = 0.05
+```
+
+the variation is between:
+
+```text
+-0.05 and +0.05
+```
+
+This prevents roads with similar hotspot influence from always having exactly the same density.
+
+---
+
+# 35. Density Generation
+
+For each physical road, density is calculated as:
+
+```text
+density
+    = base_density
+      + hotspot contribution
+      + random deviation
+```
+
+The hotspot contribution is:
+
+```text
+(max_density - base_density)
+× hotspot_effect
+```
+
+Therefore:
+
+```text
+density
+    = base_density
+      + (max_density - base_density)
+        × hotspot_effect
+      + random_deviation
+```
+
+Finally, the result is clamped:
+
+```python
+density = max(
+    0.0,
+    min(cfg.max_density, density)
+)
+```
+
+---
+
+# 36. Applying Density to Both Directions
+
+If a physical road has two directions:
+
+```text
+A → B
+B → A
+```
+
+the same density is assigned to both:
+
+```python
+edge.density = density
+
+if twin is not None:
+    twin.density = density
+```
+
+This keeps the simulated traffic condition consistent for both directions of the physical road.
+
+---
+
+# 37. Road Incidents
+
+Road incidents are represented by:
+
+```python
+edge.blocked
+```
+
+A blocked road is unavailable to the routing algorithm.
+
+The probability is controlled by:
+
+```python
+block_probability
+```
+
+The default is:
+
+```python
+block_probability = 0.01
+```
+
+meaning each physical road has a 1% probability of being blocked.
+
+---
+
+# 38. Incident Generation
+
+Incidents use a separate deterministic random generator:
+
+```python
+rng = random.Random(
+    f"incidents-{self.seed}"
+)
+```
+
+For every physical road:
+
+```python
+blocked = (
+    rng.random()
+    < self.config.block_probability
+)
+```
+
+If the road is blocked:
+
+```text
+edge.blocked = True
+```
+
+If the opposite-direction twin exists, it receives the same value.
+
+Therefore:
+
+```text
+A → B = blocked
+B → A = blocked
+```
+
+for the same physical road.
+
+---
+
+# 39. Random Seeds
 
 The scenario generator is deterministic for a given seed.
 
@@ -742,7 +1503,7 @@ Example:
 generator = ScenarioGenerator(seed=42)
 ```
 
-Running the same scenario with the same seed produces the same random density deviations and incident locations.
+Running the density and incident generation with the same seed produces the same scenario.
 
 Changing the seed:
 
@@ -750,147 +1511,41 @@ Changing the seed:
 ScenarioGenerator(seed=43)
 ```
 
-produces a different scenario.
+produces a different random scenario.
 
-This is useful for testing because scenarios can be reproduced.
+This is useful for:
 
----
-
-# 21. Applying a Scenario
-
-Typical usage:
-
-```python
-config = ScenarioConfig(
-    base_density=0.1,
-    max_density=0.9,
-    density_deviation=0.05,
-    block_probability=0.03,
-    hotspots=[
-        Hotspot(
-            lat=10.780,
-            lon=106.700,
-            intensity=1.0,
-            radius=500
-        )
-    ]
-)
-
-generator = ScenarioGenerator(
-    seed=42,
-    config=config
-)
-
-generator.apply(graph)
-```
-
-After `apply()`:
-
-```python
-edge.density
-edge.blocked
-edge.current_speed
-edge.travel_time
-```
-
-are ready to be used by the routing algorithm.
+* testing
+* benchmarking
+* comparing A* variants
+* reproducing experiments
 
 ---
 
-# 22. Scenario Examples
+# 40. Weather Model
 
-## Normal traffic
-
-```python
-ScenarioConfig(
-    base_density=0.1,
-    max_density=0.5,
-    density_deviation=0.03,
-    block_probability=0.01
-)
-```
-
-Represents relatively light traffic with occasional variation.
-
----
-
-## Rush hour
-
-```python
-ScenarioConfig(
-    base_density=0.4,
-    max_density=0.9,
-    density_deviation=0.05,
-    block_probability=0.02,
-    hotspots=[...]
-)
-```
-
-The higher baseline means that roads outside hotspots are still moderately busy.
-
-Hotspots create particularly congested areas.
-
----
-
-## Holiday / low traffic
-
-```python
-ScenarioConfig(
-    base_density=0.03,
-    max_density=0.5,
-    density_deviation=0.02,
-    block_probability=0.01
-)
-```
-
-The entire network has lower baseline traffic, while hotspots can still represent local congestion.
-
----
-
-# 23. Important Assumptions
-
-The current traffic model is a **simulation**, not real-time traffic data.
-
-The following values are generated or configured artificially:
+Weather is represented using two levels:
 
 ```text
-density
-weather_factor
-blocked
+Global weather factor
+        +
+Localized rain cells
 ```
 
-The road network itself comes from OpenStreetMap.
-
-Therefore:
-
-```text
-OSM data
-    → road geometry
-    → road length
-    → road names
-    → speed limits when available
-
-Scenario generator
-    → traffic density
-    → congestion hotspots
-    → random variation
-    → road incidents
-```
-
-## 24. Weather Scenario Generation
-
-The weather scenario models the effect of weather conditions on road travel speed. Instead of assigning a completely independent weather value to every road, the scenario uses a **global weather factor** combined with optional **spatial rain cells**. This allows weather conditions to affect large areas while also representing localized regions of heavier rain.
-
-### Weather Configuration
-
-Weather-related parameters are stored in `ScenarioConfig`:
+The corresponding configuration fields are:
 
 ```python
-global_weather_factor: float = 1.0
-rain_cells: list[RainCell] = field(default_factory=list)
+global_weather_factor
+rain_cells
 ```
 
-A `RainCell` represents a rectangular geographical area affected by rain:
+Weather modifies the effective speed of roads but does not change the underlying road network.
+
+---
+
+# 41. RainCell
+
+A `RainCell` represents a rectangular geographic region affected by rain.
 
 ```python
 @dataclass
@@ -902,158 +1557,171 @@ class RainCell:
     weather_factor: float = 0.6
 ```
 
-The four coordinate values define the boundaries of the rain cell. `weather_factor` represents the effect of the rain on the road's travel speed.
+| Attribute        | Meaning                               |
+| ---------------- | ------------------------------------- |
+| `min_lat`        | Minimum latitude                      |
+| `max_lat`        | Maximum latitude                      |
+| `min_lon`        | Minimum longitude                     |
+| `max_lon`        | Maximum longitude                     |
+| `weather_factor` | Speed multiplier inside the rain cell |
 
-For example:
+Example:
 
-```text
-weather_factor = 1.0   → no reduction
-weather_factor = 0.8   → speed reduced to 80%
-weather_factor = 0.6   → speed reduced to 60%
+```python
+RainCell(
+    min_lat=10.771,
+    max_lat=10.775,
+    min_lon=106.696,
+    max_lon=106.700,
+    weather_factor=0.6
+)
 ```
 
-Therefore, a lower weather factor represents more severe weather conditions.
+---
 
-### Global Weather
+# 42. Global Weather Factor
 
-The `global_weather_factor` applies to every road in the scenario.
+The global weather factor applies to every road.
+
+```python
+global_weather_factor = 1.0
+```
+
+Examples:
+
+```text
+1.0 → no global speed reduction
+0.9 → speed multiplied by 0.9
+0.8 → speed multiplied by 0.8
+```
+
+The initial weather value for every road is:
 
 ```python
 weather = cfg.global_weather_factor
 ```
 
-A value of `1.0` represents normal weather conditions. A value below `1.0` represents weather conditions that reduce travel speed across the entire map.
+---
+
+# 43. Localized Rain Cells
+
+The road's midpoint is used to determine whether it lies inside a rain cell.
+
+For each edge:
+
+```python
+lat, lon = midpoint
+```
+
+The implementation checks:
+
+```python
+rain_cell.min_lat <= lat <= rain_cell.max_lat
+```
+
+and:
+
+```python
+rain_cell.min_lon <= lon <= rain_cell.max_lon
+```
+
+A road is inside the rain cell only when both conditions are true.
+
+---
+
+# 44. Rain Cell Effects
+
+If an edge midpoint is inside a rain cell:
+
+```python
+weather *= rain_cell.weather_factor
+```
 
 For example:
 
 ```text
 global_weather_factor = 1.0
+rain_cell.weather_factor = 0.6
 ```
 
-means that weather does not modify the normal road speed.
-
-A value such as:
+produces:
 
 ```text
-global_weather_factor = 0.9
+weather_factor = 1.0 × 0.6
+               = 0.6
 ```
 
-represents a scenario where weather conditions cause a general reduction in speed throughout the road network.
+Therefore, the road's weather-adjusted speed is multiplied by `0.6`.
 
-### Localized Rain Cells
+---
 
-To represent spatially varying weather, the scenario can contain one or more `RainCell` objects.
+# 45. Multiple Rain Cells
 
-For each road, the generator calculates the midpoint of its geometry:
+If a road lies inside multiple rain cells, their effects are multiplied.
 
-```python
-lat, lon = road_midpoint(edge.geometry)
-```
-
-The midpoint is then tested against every rain cell:
-
-```python
-inside = (
-    rain_cell.min_lat <= lat <= rain_cell.max_lat
-    and
-    rain_cell.min_lon <= lon <= rain_cell.max_lon
-)
-```
-
-If the road midpoint lies inside a rain cell, the road's weather factor is multiplied by that cell's `weather_factor`:
-
-```python
-if inside:
-    weather *= rain_cell.weather_factor
-```
-
-This produces a spatially varying weather scenario. Roads outside the rain cells retain the global weather factor, while roads inside affected regions receive an additional reduction.
-
-For example, consider:
+For example:
 
 ```text
-global_weather_factor = 1.0
+global factor = 1.0
 
-Rain Cell A:
-    weather_factor = 0.6
+rain cell 1 = 0.8
+rain cell 2 = 0.7
 ```
 
-A road outside the rain cell receives:
+produces:
 
 ```text
-weather = 1.0
+weather_factor
+    = 1.0 × 0.8 × 0.7
+    = 0.56
 ```
 
-while a road inside the rain cell receives:
+Therefore, the final weather factor is:
 
 ```text
-weather = 1.0 × 0.6 = 0.6
+0.56
 ```
 
-If multiple rain cells overlap, their effects are multiplied together. For example:
+---
+
+# 46. Applying Weather to Both Directions
+
+As with traffic density and incidents, both directions of the same physical road receive the same weather factor.
+
+For:
 
 ```text
-global_weather_factor = 1.0
-rain_cell_1 = 0.8
-rain_cell_2 = 0.7
-
-weather = 1.0 × 0.8 × 0.7
-        = 0.56
+A → B
+B → A
 ```
 
-This means the affected road operates at 56% of its normal weather-adjusted speed.
-
-### Applying Weather to the Road Network
-
-The complete weather assignment is performed by `_assign_weather()`:
+the implementation assigns:
 
 ```python
-def _assign_weather(self, graph: Graph) -> None:
-    cfg = self.config
+edge.weather_factor = weather
 
-    for edge, twin in _roads(graph):
-
-        lat, lon = road_midpoint(edge.geometry)
-
-        weather = cfg.global_weather_factor
-
-        for rain_cell in cfg.rain_cells:
-            inside = (
-                rain_cell.min_lat <= lat <= rain_cell.max_lat
-                and
-                rain_cell.min_lon <= lon <= rain_cell.max_lon
-            )
-
-            if inside:
-                weather *= rain_cell.weather_factor
-
-        edge.weather_factor = weather
-
-        if twin:
-            twin.weather_factor = weather
-```
-
-The `_roads()` helper ensures that a physical two-way road is processed only once. When an edge has an opposite-direction twin, the same weather factor is assigned to both directions:
-
-```python
-if twin:
+if twin is not None:
     twin.weather_factor = weather
 ```
 
-This keeps the weather condition consistent across both directions of the same physical road.
+This keeps the environmental condition consistent across both directions.
 
-### Interaction with Road Speed
+---
 
-The generated `weather_factor` is later used when calculating the effective road speed. The speed model applies both traffic density and weather:
+# 47. Interaction Between Traffic and Weather
 
-```python
-speed = self.speed_limit * (1 - self.density)
-speed *= self.weather_factor
+Traffic density and weather both affect current speed.
+
+The complete speed model is:
+
+```text
+current_speed
+    = speed_limit
+      × (1 - density)
+      × weather_factor
 ```
 
-Consequently, a road can be affected by both congestion and weather simultaneously.
-
-For example, if:
+For example:
 
 ```text
 speed_limit = 50 km/h
@@ -1061,40 +1729,406 @@ density = 0.4
 weather_factor = 0.6
 ```
 
-then:
+First apply traffic:
 
 ```text
-traffic-adjusted speed
-= 50 × (1 - 0.4)
+50 × (1 - 0.4)
 = 30 km/h
+```
 
-weather-adjusted speed
-= 30 × 0.6
+Then weather:
+
+```text
+30 × 0.6
 = 18 km/h
 ```
 
-Thus, the scenario generator does not directly assign a final travel speed. Instead, it assigns environmental conditions (`density` and `weather_factor`) that are subsequently used by the road speed model.
-
-### Purpose of the Model
-
-The main purpose of the weather model is to introduce **spatial variation** into the road network rather than treating weather as a single constant for the entire map.
-
-A scenario can therefore represent conditions such as:
+Therefore:
 
 ```text
-                 Rain Cell
-              ┌─────────────┐
-              │  factor 0.6 │
-              │             │
-      ────────┼─────────────┼────────
-              │             │
-      ────────┼─────────────┼────────
-              └─────────────┘
-
-    Outside → global factor
-    Inside  → global factor × 0.6
+current_speed = 18 km/h
 ```
 
-This allows different roads to experience different effective travel speeds depending on their geographic location.
+subject to the minimum speed constraint.
 
-The model is intentionally scenario-based rather than a real-time weather prediction system. Rain cells can be configured manually to create reproducible test cases, making it possible to evaluate how the routing algorithm behaves when adverse weather affects particular regions of the road network.
+---
+
+# 48. ScenarioGenerator
+
+The main scenario generation class is:
+
+```python
+class ScenarioGenerator:
+    ...
+```
+
+It is initialized with:
+
+```python
+ScenarioGenerator(
+    seed=42,
+    config=config
+)
+```
+
+If no configuration is supplied:
+
+```python
+ScenarioConfig()
+```
+
+is used.
+
+---
+
+# 49. Applying a Scenario
+
+The main method is:
+
+```python
+generator.apply(graph)
+```
+
+The method first obtains the physical roads:
+
+```python
+road_list = list(roads(graph))
+```
+
+Then it applies the three scenario components:
+
+```text
+_assign_density()
+        ↓
+_assign_incidents()
+        ↓
+_assign_weather()
+```
+
+The complete process is:
+
+```text
+Graph
+  │
+  ▼
+Physical roads
+  │
+  ├── Traffic density
+  │
+  ├── Road incidents
+  │
+  └── Weather
+  │
+  ▼
+Updated Graph
+```
+
+---
+
+# 50. Scenario Application Order
+
+The scenario is applied in the following order:
+
+```python
+self._assign_density(road_list)
+self._assign_incidents(road_list)
+self._assign_weather(road_list)
+```
+
+The three components are stored independently:
+
+```text
+density
+blocked
+weather_factor
+```
+
+The final travel time is then determined by the `Edge` properties.
+
+---
+
+# 51. Example Scenario Configuration
+
+A complete scenario can be configured as:
+
+```python
+config = ScenarioConfig(
+    base_density=0.1,
+    max_density=0.9,
+    density_deviation=0.05,
+    block_probability=0.01,
+    global_weather_factor=1.0,
+    hotspots=[
+        Hotspot(
+            lat=10.780,
+            lon=106.700,
+            intensity=1.0,
+            radius=500
+        )
+    ],
+    rain_cells=[
+        RainCell(
+            min_lat=10.771,
+            max_lat=10.775,
+            min_lon=106.696,
+            max_lon=106.700,
+            weather_factor=0.6
+        )
+    ]
+)
+```
+
+The generator can then be created with:
+
+```python
+generator = ScenarioGenerator(
+    seed=42,
+    config=config
+)
+```
+
+and applied using:
+
+```python
+generator.apply(graph)
+```
+
+---
+
+# 52. Example: Normal Traffic
+
+```python
+ScenarioConfig(
+    base_density=0.1,
+    max_density=0.5,
+    density_deviation=0.03,
+    block_probability=0.01
+)
+```
+
+This represents a relatively light traffic scenario with small local variations and occasional road incidents.
+
+---
+
+# 53. Example: Rush Hour
+
+```python
+ScenarioConfig(
+    base_density=0.4,
+    max_density=0.9,
+    density_deviation=0.05,
+    block_probability=0.02,
+    hotspots=[...]
+)
+```
+
+The higher baseline means that the entire network starts with moderate traffic.
+
+Hotspots then create areas of particularly high congestion.
+
+---
+
+# 54. Example: Heavy Rain
+
+```python
+ScenarioConfig(
+    base_density=0.3,
+    max_density=0.9,
+    density_deviation=0.05,
+    block_probability=0.01,
+    global_weather_factor=0.85,
+    rain_cells=[
+        RainCell(
+            min_lat=10.771,
+            max_lat=10.775,
+            min_lon=106.696,
+            max_lon=106.700,
+            weather_factor=0.6
+        )
+    ]
+)
+```
+
+In this scenario:
+
+```text
+Entire network
+    → weather factor 0.85
+
+Inside rain cell
+    → 0.85 × 0.6
+    → 0.51
+```
+
+Thus, roads inside the rain cell experience a much stronger speed reduction.
+
+---
+
+# 55. Geographic Utilities
+
+The module provides two geographic helper functions:
+
+```python
+haversine_m(...)
+nearest_node(...)
+```
+
+---
+
+# 56. Haversine Distance
+
+The function:
+
+```python
+haversine_m(
+    lat1,
+    lon1,
+    lat2,
+    lon2
+)
+```
+
+calculates the great-circle distance between two geographic coordinates.
+
+The result is returned in meters.
+
+The implementation uses:
+
+```text
+Earth radius = 6,371,000 meters
+```
+
+The Haversine formula accounts for the Earth's curvature and is therefore more appropriate for geographic coordinates than a simple Euclidean distance in latitude/longitude space.
+
+---
+
+# 57. Nearest Node
+
+The function:
+
+```python
+nearest_node(graph, point)
+```
+
+finds the graph node geographically closest to a given point.
+
+The input is:
+
+```python
+point = (latitude, longitude)
+```
+
+The function compares the point with every graph vertex using the Haversine distance.
+
+Conceptually:
+
+```text
+Input point
+    │
+    ▼
+Calculate distance to every Vertex
+    │
+    ▼
+Select minimum distance
+    │
+    ▼
+Nearest node ID
+```
+
+This is useful when a user specifies a route endpoint using geographic coordinates rather than a graph node ID.
+
+---
+
+# 58. Final Data Model
+
+After graph loading and scenario generation, each edge contains both static road information and dynamic scenario information.
+
+```text
+Edge
+│
+├── Static road information
+│   ├── source
+│   ├── target
+│   ├── length
+│   ├── speed_limit
+│   ├── name
+│   └── midpoint
+│
+└── Dynamic scenario information
+    ├── density
+    ├── weather_factor
+    └── blocked
+```
+
+---
+
+# 59. Complete Processing Pipeline
+
+The complete system can be summarized as:
+
+```text
+                Kaggle Dataset
+                      │
+                      ▼
+                 CSV Files
+                      │
+              ┌───────┴───────┐
+              │               │
+          nodes.csv       segments.csv
+              │               │
+              ▼               ▼
+          Vertex data     Edge data
+              │               │
+              └───────┬───────┘
+                      ▼
+                 load_graph()
+                      │
+                      ├── Validate BBOX
+                      ├── Filter nodes
+                      ├── Validate segments
+                      ├── Remove self-loops
+                      ├── Parse speed
+                      ├── Calculate midpoint
+                      ├── Remove longer parallel edges
+                      └── Build Graph
+                              │
+                              ▼
+                       ScenarioGenerator
+                              │
+                ┌─────────────┼─────────────┐
+                │             │             │
+                ▼             ▼             ▼
+             Density       Incidents      Weather
+                │             │             │
+                │             │             │
+                └─────────────┼─────────────┘
+                              ▼
+                        Updated Graph
+                              │
+                              ▼
+                         A* Search
+                              │
+                              ▼
+                    Estimated Travel Time
+```
+
+---
+
+# 60. Important Assumptions
+
+The current module makes the following assumptions:
+
+1. The road network is provided locally through `nodes.csv` and `segments.csv`.
+2. `nodes.csv` contains valid node coordinates through `_id`, `long`, and `lat`.
+3. `segments.csv` contains directed road segments through `s_node_id` and `e_node_id`.
+4. Segment length is measured in meters.
+5. `max_velocity` is expressed in km/h.
+6. Missing or invalid speed values use `DEFAULT_SPEED = 40 km/h`.
+7. Traffic density is simulated rather than treated as a directly measured real-time value by this module.
+8. Weather conditions are simulated using a global factor and optional rectangular rain cells.
+9. Road incidents are simulated probabilistically using `block_probability`.
+10. Opposite-direction edges representing the same physical road receive the same density, incident status, and weather factor.
+11. The graph retains only the shortest edge for each directed `(source, target)` pair.
+12. The underlying road network is not modified when a scenario is generated; only dynamic edge attributes are changed.
+
+---
